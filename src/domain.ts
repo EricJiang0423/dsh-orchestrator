@@ -1,5 +1,6 @@
 /**
- * Board data model: one storage domain with four tables.
+ * Board data model: one storage domain with six tables (projects, tasks,
+ * comments, activities, session messages, settings).
  *
  * Ported from dashi-taskboard's `shared/domain.mjs` and its hand-written SQLite
  * schema (40+ ALTER statements) onto `ctx.storageDomain`, which validates every
@@ -9,14 +10,15 @@
  * intake column for issues an agent asked for but a human has not accepted.
  * @module dsh-orchestrator/domain
  */
-import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
+import { z } from 'zod'
 
 /** Branded record keys — plain strings on the medium, distinct at compile time. */
 export type ProjectId = string & { readonly __brand: 'ProjectId' }
 export type TaskId = string & { readonly __brand: 'TaskId' }
 export type CommentId = string & { readonly __brand: 'CommentId' }
 export type ActivityId = string & { readonly __brand: 'ActivityId' }
+export type MessageId = string & { readonly __brand: 'MessageId' }
 export type SettingsKey = string & { readonly __brand: 'SettingsKey' }
 
 /** The one settings record key: the scheduler's durable knobs. */
@@ -37,6 +39,7 @@ export const TASK_STATUSES = [
   'in_review',
   'blocked',
   'done',
+  'archieved',
   'failed',
   'canceled',
 ] as const
@@ -211,7 +214,41 @@ const schedulerSettingsSchema = z.object({
 /** Durable scheduler preferences — what the board header switches persist. */
 export type SchedulerSettings = z.infer<typeof schedulerSettingsSchema>
 
-/** The board's storage domain: five tables under one write chain. */
+/**
+ * One message from one issue-session's agent to another's ("session mail").
+ *
+ * dsh has no native peer-to-peer session messaging: its subagent followup is
+ * strictly parent→child, so two independent issue sessions cannot reach each
+ * other on their own. The board is the one party that knows both, so it
+ * brokers the mail: the model-facing `taskboard_message` tool stores the
+ * message here, the host delivers it into the live target agent's inbox
+ * (`Agent.followup`), and the Taskboard tab renders the trail on both issues'
+ * cards.
+ */
+const sessionMessageSchema = z.object({
+  id: z.string(),
+  /** The board the message is displayed on: the TARGET issue's project. */
+  projectId: z.string(),
+  /** The sending agent's session. */
+  fromSessionId: z.string(),
+  /** Attribution of the sender. */
+  fromAgent: actorSchema,
+  /** The issue the sender was working, when its session is bound to one. */
+  fromIssueId: z.string().optional(),
+  /** The receiving session (the one bound to `toIssueId`). */
+  toSessionId: z.string(),
+  /** The issue whose working agent is addressed. */
+  toIssueId: z.string(),
+  /** Message body, Markdown. */
+  body: z.string(),
+  createdAt: z.string(),
+  /** When the live target agent accepted the message into its inbox; absent while pending. */
+  deliveredAt: z.string().optional(),
+})
+/** One inter-session agent message. */
+export type SessionMessage = z.infer<typeof sessionMessageSchema>
+
+/** The board's storage domain: six tables under one write chain. */
 export const taskboardDomain = defineDomain({
   name: 'taskboard',
   version: 1,
@@ -220,6 +257,7 @@ export const taskboardDomain = defineDomain({
     tasks: domainTable<TaskId, Task>(taskSchema),
     comments: domainTable<CommentId, Comment>(commentSchema),
     activities: domainTable<ActivityId, Activity>(activitySchema),
+    messages: domainTable<MessageId, SessionMessage>(sessionMessageSchema),
     settings: domainTable<SettingsKey, SchedulerSettings>(schedulerSettingsSchema),
   },
 })
@@ -228,14 +266,18 @@ export const taskboardDomain = defineDomain({
  * Whether a status change is allowed for this actor.
  *
  * The board is deliberately permissive — a human drags a card anywhere — with
- * exactly two hard fences, both about not letting an agent grant itself work or
- * declare its own work accepted:
+ * exactly three hard fences, all about not letting an agent grant itself work,
+ * declare its own work accepted, or shelve it as history:
  *
  * 1. Leaving `proposed` is a human act. That is what makes the approval queue a
  *    queue rather than a formality, and it is the durable half of the approval
  *    design (dsh's own one-shot `ctx.approval` only works inside an open turn).
  * 2. Reaching `done` is a human act. An agent reports work finished by moving to
  *    `in_review`; acceptance is not its call.
+ * 3. Reaching `archieved` is a human act, symmetric to `done`: archiving puts
+ *    accepted (or otherwise settled) work on the shelf, and shelving is not the
+ *    agent's call either. Moving OUT of `archieved` stays permissive, like
+ *    leaving `done`, so a human can restore shelved work to the flow.
  * @param from - Current status.
  * @param to - Requested status.
  * @param actor - Who is asking.
@@ -246,7 +288,7 @@ export function canTransition(from: TaskStatus, to: TaskStatus, actor: ActorType
   // Nothing moves back into the approval queue; `proposed` is an intake state.
   if (to === 'proposed') return false
   if (from === 'proposed') return actor === 'user' && (to === 'backlog' || to === 'canceled')
-  if (to === 'done') return actor === 'user'
+  if (to === 'done' || to === 'archieved') return actor === 'user'
   return true
 }
 

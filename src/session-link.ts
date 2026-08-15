@@ -23,15 +23,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, ModelSelectionRef, ModelSelection } from '@deepseek-ai/dsh-agent'
-import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-goal'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { LOCAL_USER } from './actors.ts'
+import type { Actor, Project, SessionMessage, Task } from './domain.ts'
 import { byPriority } from './plan-loop.ts'
-import { TaskboardError, type Taskboard } from './service.ts'
-import type { Project, Task } from './domain.ts'
 import { nextRunAtMs } from './schedule.ts'
+import { TaskboardError, type Taskboard } from './service.ts'
 import type { SchedulerConfig, SchedulerState } from './wire.ts'
 
 /** What the model is told when an issue is handed to a fresh session. */
@@ -43,8 +43,27 @@ function briefFor(task: Task): string {
     'This session exists for this issue alone, and the issue is now in_progress.',
     'Follow the manage-taskboard skill: comment as you go, move it to in_review when the',
     'work is done and verified, and use taskboard_propose for anything else you find',
-    'rather than widening this issue. You cannot mark it done — a human accepts the work.',
-  ].filter(Boolean).join('\n')
+    'rather than widening this issue. You cannot mark it done or archieved — a human accepts and archives the work.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+/**
+ * The working directory carried by a session, whether it lives in the main
+ * session store or in the spawned-agent registry. Returns undefined for a
+ * session that has no cwd, and for an unknown session id.
+ * @param ctx - Context; `sessions` and `agents` are read optionally.
+ * @param sessionId - The session to look up, if any.
+ * @returns the session's cwd, or undefined.
+ */
+export function sessionCwd(ctx: Context, sessionId: string | undefined): string | undefined {
+  if (sessionId === undefined) return undefined
+  const sid = SessionId(sessionId)
+  return (
+    ctx.reflect.get('sessions')?.get(sid)?.header.cwd ??
+    ctx.reflect.get('agents')?.get(sid)?.session.header.cwd
+  )
 }
 
 /**
@@ -66,21 +85,23 @@ export async function resolveProject(
   board: Taskboard,
   sessionId: string,
 ): Promise<Project> {
-  const sid = SessionId(sessionId)
-  const cwd = ctx.reflect.get('sessions')?.get(sid)?.header.cwd
-    ?? ctx.reflect.get('agents')?.get(sid)?.session.header.cwd
+  const cwd = sessionCwd(ctx, sessionId)
   // Non-strict: the workspace registry's providing fiber can sit outside the
   // active tree (lazy/optional mounts), and this is a read-only consultation —
   // a moment of staleness during teardown is harmless.
   const workspaces = ctx.reflect.get('workspaceRegistry', false)
   if (cwd !== undefined && workspaces !== undefined) {
-    const workspace = await workspaces.resolveByPath(cwd).catch(() => undefined)
-      ?? await workspaces.create(cwd).catch(() => undefined)
+    const workspace =
+      (await workspaces.resolveByPath(cwd).catch(() => undefined)) ??
+      (await workspaces.create(cwd).catch(() => undefined))
     if (workspace !== undefined) {
       return board.projectForWorkspace(workspace.id, workspace.path, workspace.title)
     }
   }
-  return board.getProject('default') ?? board.createProject({ id: 'default', name: 'Tasks' })
+  return (
+    board.getProject('default') ??
+    board.createProject({ id: 'default', name: 'Tasks', workspacePath: process.cwd() })
+  )
 }
 
 /**
@@ -112,40 +133,52 @@ export function selectionRefFor(selection: ModelSelection | undefined): ModelSel
  * @param opts.force - Open a fresh session even when a live session is already
  *   bound (used by re-run: a settled issue's session lingers in the registry,
  *   and a re-run must not silently return the stale one).
+ * @param opts.cwd - Optional fallback working directory when the issue's
+ *   project has no workspace path (for example the fallback "Tasks" board).
  * @returns the updated issue, now bound to its own session.
  */
 export async function startTask(
   ctx: Context,
   board: Taskboard,
   taskId: string,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; cwd?: string } = {},
 ): Promise<Task> {
   const agents = ctx.reflect.get('agents')
-  if (agents === undefined) throw new TaskboardError('not-found', 'no agent registry in this profile')
+  if (agents === undefined)
+    throw new TaskboardError('not-found', 'no agent registry in this profile')
 
   const current = board.getTask(taskId)
-  if (current === undefined) throw new TaskboardError('not-found', `task "${taskId}" does not exist`)
+  if (current === undefined)
+    throw new TaskboardError('not-found', `task "${taskId}" does not exist`)
   // A live session already owns this issue; do not open a second one for it.
   // `force` overrides exactly this guard for re-runs, never for the scheduler's
   // ordinary pickup.
-  const live = current.sessionId !== undefined && agents.get(SessionId(current.sessionId)) !== undefined
+  const live =
+    current.sessionId !== undefined && agents.get(SessionId(current.sessionId)) !== undefined
   if (live && opts.force !== true) return current
 
   // The issue's own project decides where its session runs, so work lands in the
-  // repository the board belongs to. The session also inherits the harness's
+  // repository the board belongs to. A project without a workspace path (the
+  // fallback "Tasks" board, for example) cannot say where its work should run;
+  // fall back to the caller-provided cwd, then to the harness process's cwd,
+  // rather than creating a session with no cwd at all. A no-cwd session is filed
+  // under "ungrouped" by the session store and prompt assembly fails on the
+  // `{{cwd}}` variable.
+  //
+  // The session also inherits the harness's
   // default model selection — provider, model, AND reasoning effort — through
   // `installModelSelection` in `setup` (AgentOptions cannot carry effort), and
   // the default agent preset, which is what gives the session its working tool
   // kit (file tools, shell, skills). A preset-less session would be a
   // board-only agent that can look at issues but not do the work.
-  const cwd = board.getProject(current.projectId)?.workspacePath
+  const cwd = board.getProject(current.projectId)?.workspacePath ?? opts.cwd ?? process.cwd()
   const selection = ctx.reflect.get('agentDefaultModel', false)?.currentSelection?.()
   const presets = ctx.reflect.get('agentPresets', false)
   const preset = await presets?.resolve().catch(() => undefined)
   const handle = await agents.create({
     sessionId: SessionId(crypto.randomUUID()),
     meta: {
-      ...(cwd !== undefined ? { cwd } : {}),
+      cwd,
       ...(preset !== undefined ? { agentPreset: preset.id } : {}),
     },
     // Without the provider/model pair, prompt assembly fails on the `{{model}}`
@@ -166,6 +199,25 @@ export async function startTask(
     },
   })
   const agent: Agent = handle.agent
+
+  // The sidebar groups sessions by workspace MEMBERSHIP (workspace.sessionIds),
+  // which is only established by `attachSession` — the web layer's create/fork
+  // paths call it, and a session created anywhere else would otherwise land in
+  // the "ungrouped" bucket even though it carries a cwd. Attach the fresh
+  // session to the workspace owning its cwd (creating that workspace when the
+  // directory is not yet owned, exactly as board resolution does). Best-effort:
+  // a profile without a workspace registry must still be able to start work.
+  try {
+    const workspaces = ctx.reflect.get('workspaceRegistry', false)
+    if (workspaces !== undefined) {
+      const workspace =
+        (await workspaces.resolveByPath(cwd).catch(() => undefined)) ??
+        (await workspaces.create(cwd).catch(() => undefined))
+      if (workspace !== undefined) await workspace.attachSession(agent.id)
+    }
+  } catch (error) {
+    ctx.logger.warn('taskboard: could not attach the issue session to its workspace', error)
+  }
 
   // Open the execution record AND bind the session / move to in_progress in one
   // atomic CAS, so the attempt is durable before the agent is handed the issue.
@@ -189,12 +241,144 @@ export async function startTask(
     ctx.logger.warn('taskboard: could not set the session goal', error)
   }
 
-  agent.followup(createUserMessage({
-    content: [{ type: 'text', text: briefFor(task) }],
-    source: { kind: 'user' },
-  }))
+  agent.followup(
+    createUserMessage({
+      content: [{ type: 'text', text: briefFor(task) }],
+      source: { kind: 'user' },
+    }),
+  )
+
+  // A fresh session may have been addressed while it was away: hand it the
+  // pending session mail after the brief, in arrival order.
+  await deliverPending(ctx, board, agent.id)
 
   return task
+}
+
+/**
+ * The user-role text a delivered message becomes in the target session.
+ * @param message - The stored message.
+ * @param board - The board, for endpoint issue titles.
+ * @returns the delivery text.
+ */
+function mailText(message: SessionMessage, board: Taskboard): string {
+  const fromIssue =
+    message.fromIssueId !== undefined ? board.getTask(message.fromIssueId) : undefined
+  const toIssue = board.getTask(message.toIssueId)
+  const fromLabel =
+    fromIssue !== undefined
+      ? `the agent working issue "${fromIssue.title}"`
+      : `an agent in session ${message.fromSessionId}`
+  const target = toIssue !== undefined ? `issue "${toIssue.title}"` : 'the taskboard'
+  return [
+    `Message from ${fromLabel}, via the taskboard (session mail):`,
+    '',
+    message.body,
+    '',
+    `You can reply with the \`taskboard_message\` tool, addressed to ${target} or to session ${message.fromSessionId}.`,
+  ].join('\n')
+}
+
+/**
+ * Deliver one stored message into the live target agent's inbox, and mark it
+ * delivered. A message whose target session is not live stays pending on the
+ * board; {@link deliverPending} retries when that session comes back.
+ * @param ctx - Context with `taskboard`; `agents` is read optionally.
+ * @param board - The board service.
+ * @param message - The stored message.
+ * @returns the message, now delivered when the target was live.
+ */
+export async function deliverMessage(
+  ctx: Context,
+  board: Taskboard,
+  message: SessionMessage,
+): Promise<SessionMessage> {
+  const agents = ctx.reflect.get('agents')
+  if (agents === undefined) return message
+  // The registry hands out the bare live Agent — the bare agent is exactly
+  // what `followup` needs, and the handle is only for its creating owner.
+  const agent = agents.get(SessionId(message.toSessionId))
+  if (agent === undefined) return message
+  agent.followup(
+    createUserMessage({
+      content: [{ type: 'text', text: mailText(message, board) }],
+      source: { kind: 'user' },
+    }),
+  )
+  return board.markDelivered(message.id)
+}
+
+/**
+ * Deliver every undelivered message addressed to one session.
+ * @param ctx - Context with `taskboard`; `agents` is read optionally.
+ * @param board - The board service.
+ * @param sessionId - The receiving session.
+ * @returns resolution once every pending message has been attempted.
+ */
+export async function deliverPending(
+  ctx: Context,
+  board: Taskboard,
+  sessionId: string,
+): Promise<void> {
+  for (const message of board.listMessages({ sessionId })) {
+    if (message.toSessionId !== sessionId || message.deliveredAt !== undefined) continue
+    await deliverMessage(ctx, board, message)
+  }
+}
+
+/**
+ * Send session mail: validate, store, and deliver in one step. The shared
+ * path of the model-facing `taskboard_message` tool; exported so tests can
+ * drive it without a tool registry.
+ *
+ * dsh has no native peer-to-peer session messaging — subagent followup is
+ * strictly parent→child — so the board brokers it: it is the one party that
+ * holds both sessions' records and the live agent registry.
+ * @param ctx - Context with `taskboard`; `agents` is read optionally.
+ * @param board - The board service.
+ * @param input - Sender, addressed target, and body.
+ * @returns the stored message, delivered when the target session is live.
+ */
+export async function sendSessionMail(
+  ctx: Context,
+  board: Taskboard,
+  input: {
+    fromSessionId: string
+    fromAgent: Actor
+    toIssueId?: string
+    toSessionId?: string
+    body: string
+  },
+): Promise<SessionMessage> {
+  if (input.body.trim() === '') {
+    throw new TaskboardError('invalid-input', 'message body is empty')
+  }
+  if (input.toIssueId === undefined && input.toSessionId === undefined) {
+    throw new TaskboardError('invalid-input', 'address the message to an issue or a session')
+  }
+  // Resolve the addressed issue: directly, or through the session bound to it.
+  let target = input.toIssueId !== undefined ? board.getTask(input.toIssueId) : undefined
+  if (target === undefined && input.toSessionId !== undefined) {
+    target = board.listTasks({ sessionId: input.toSessionId })[0]
+  }
+  if (target === undefined) {
+    throw new TaskboardError('not-found', 'no issue bound to the addressed session or issue')
+  }
+  if (target.sessionId === undefined) {
+    throw new TaskboardError('invalid-input', 'the addressed issue has no working session yet')
+  }
+  // The sender's issue, when this caller's session is itself working one.
+  const fromIssue = board.listTasks({ sessionId: input.fromSessionId })[0]
+  const message = await board.postMessage({
+    projectId: target.projectId,
+    fromSessionId: input.fromSessionId,
+    fromAgent: input.fromAgent,
+    toSessionId: target.sessionId,
+    toIssueId: target.id,
+    ...(fromIssue !== undefined ? { fromIssueId: fromIssue.id } : {}),
+    body: input.body.trim(),
+  })
+  return deliverMessage(ctx, board, message)
 }
 
 /**
@@ -212,12 +396,13 @@ export async function startNextTask(
   ctx: Context,
   board: Taskboard,
   projectId?: string,
+  cwd?: string,
 ): Promise<Task | null> {
   const [next] = board
     .listTasks({ ...(projectId !== undefined ? { projectId } : {}), status: 'todo' })
     .sort(byPriority)
   if (next === undefined) return null
-  return startTask(ctx, board, next.id)
+  return startTask(ctx, board, next.id, { ...(cwd !== undefined ? { cwd } : {}) })
 }
 
 /**
@@ -245,8 +430,12 @@ export class Scheduler {
    * @param ctx - Context with `taskboard`; `agents` is read optionally.
    * @param config - Initial limits.
    */
-  constructor(private readonly ctx: Context, config: SchedulerConfig = {}) {
-    this.concurrency = Math.max(1, config.concurrency ?? 1)
+  constructor(
+    private readonly ctx: Context,
+    config: SchedulerConfig = {},
+  ) {
+    // Default parallel width: 5 issues at once out of the box.
+    this.concurrency = Math.max(1, config.concurrency ?? 5)
     // Pulling is the point of the orchestrator: out of the box it works the
     // todo queue by itself. The board bar shows the toggle, so turning it off
     // is one click — but nothing starts until the first trigger (a board
@@ -267,9 +456,10 @@ export class Scheduler {
       // Slots are global — an in-flight issue holds one whether or not this
       // board can see it — so running is never project-scoped.
       running: this.runningCount(),
-      waiting: this.ctx.taskboard
-        .listTasks({ status: 'todo', ...(projectId !== undefined ? { projectId } : {}) })
-        .length,
+      waiting: this.ctx.taskboard.listTasks({
+        status: 'todo',
+        ...(projectId !== undefined ? { projectId } : {}),
+      }).length,
     }
   }
 
@@ -314,12 +504,14 @@ export class Scheduler {
     if (next.autoPull !== undefined) this.autoPull = next.autoPull
     this.dirty = true
     if (persist) {
-      void this.ctx.taskboard.setSchedulerSettings({
-        concurrency: this.concurrency,
-        autoPull: this.autoPull,
-      }).catch((error: unknown) => {
-        this.ctx.logger.warn('taskboard: could not persist scheduler settings', error)
-      })
+      void this.ctx.taskboard
+        .setSchedulerSettings({
+          concurrency: this.concurrency,
+          autoPull: this.autoPull,
+        })
+        .catch((error: unknown) => {
+          this.ctx.logger.warn('taskboard: could not persist scheduler settings', error)
+        })
     }
   }
 
@@ -332,10 +524,12 @@ export class Scheduler {
    */
   private runningCount(): number {
     const agents = this.ctx.reflect.get('agents')
-    return this.ctx.taskboard.listTasks({ status: 'in_progress' })
-      .filter(task => task.sessionId !== undefined
-        && agents?.get(SessionId(task.sessionId)) !== undefined)
-      .length
+    return this.ctx.taskboard
+      .listTasks({ status: 'in_progress' })
+      .filter(
+        task =>
+          task.sessionId !== undefined && agents?.get(SessionId(task.sessionId)) !== undefined,
+      ).length
   }
 
   /**
@@ -392,8 +586,9 @@ export class Scheduler {
           // Repaired / legacy data: recompute from the expression and wait.
           const repaired = nextRunAtMs(schedule.cron, now)
           if (repaired === undefined) continue
-          await this.ctx.taskboard.rollSchedule(task.id, repaired)
-            .catch((error: unknown) => { this.ctx.logger.warn('taskboard: could not repair schedule', error) })
+          await this.ctx.taskboard.rollSchedule(task.id, repaired).catch((error: unknown) => {
+            this.ctx.logger.warn('taskboard: could not repair schedule', error)
+          })
           continue
         }
         if (due > now) continue
@@ -403,14 +598,16 @@ export class Scheduler {
           // Executing at the due moment: skip this occurrence rather than pile
           // a run onto an open one. The rule still rolls forward to `next`
           // (and leaves lastTriggeredAt untouched — nothing fired).
-          await this.ctx.taskboard.rollSchedule(task.id, next)
-            .catch((error: unknown) => { this.ctx.logger.warn('taskboard: could not roll schedule', error) })
+          await this.ctx.taskboard.rollSchedule(task.id, next).catch((error: unknown) => {
+            this.ctx.logger.warn('taskboard: could not roll schedule', error)
+          })
           continue
         }
         try {
           const started = await startTask(this.ctx, this.ctx.taskboard, task.id, { force: true })
-          await this.ctx.taskboard.rollSchedule(started.id, next, now)
-            .catch((error: unknown) => { this.ctx.logger.warn('taskboard: could not roll schedule', error) })
+          await this.ctx.taskboard.rollSchedule(started.id, next, now).catch((error: unknown) => {
+            this.ctx.logger.warn('taskboard: could not roll schedule', error)
+          })
           this.ctx.logger.info(`taskboard: scheduled run of "${started.title}" (${started.id})`)
         } catch (error) {
           // A failed trigger keeps its due slot and retries on the next tick.
@@ -448,10 +645,16 @@ function settleAgentRun(
   error?: string,
 ): void {
   for (const task of board.listTasks({ status: 'in_progress', sessionId: agentId })) {
-    void board.settleExecution(task.id, result, {
-      actor: LOCAL_USER,
-      ...(result === 'failed' ? { error: error ?? 'agent turn failed', status: 'failed' as const } : {}),
-    }).catch((cause: unknown) => { ctx.logger.warn('taskboard: could not settle execution', cause) })
+    void board
+      .settleExecution(task.id, result, {
+        actor: LOCAL_USER,
+        ...(result === 'failed'
+          ? { error: error ?? 'agent turn failed', status: 'failed' as const }
+          : {}),
+      })
+      .catch((cause: unknown) => {
+        ctx.logger.warn('taskboard: could not settle execution', cause)
+      })
   }
 }
 
@@ -474,11 +677,152 @@ export async function reconcileOrphans(ctx: Context, board: Taskboard): Promise<
   for (const task of board.listTasks({ status: 'in_progress' })) {
     if (task.sessionId === undefined) continue
     if (agents.get(SessionId(task.sessionId)) !== undefined) continue
-    await board.settleExecution(task.id, 'failed', {
-      actor: LOCAL_USER,
-      error: 'execution session no longer exists',
-      status: 'failed',
-    }).catch((cause: unknown) => { ctx.logger.warn('taskboard: could not reconcile orphaned execution', cause) })
+    await board
+      .settleExecution(task.id, 'failed', {
+        actor: LOCAL_USER,
+        error: 'execution session no longer exists',
+        status: 'failed',
+      })
+      .catch((cause: unknown) => {
+        ctx.logger.warn('taskboard: could not reconcile orphaned execution', cause)
+      })
+  }
+}
+
+/**
+ * The cwd of every persisted session, whether live or long dead.
+ *
+ * The session persistence layer is the only place a dead session's cwd still
+ * lives (the live registries answer only for loaded sessions), so it is the
+ * authoritative source for the mount-time reconciles that re-file historical
+ * sessions and issues.
+ * @param ctx - Context; `sessionPersistence` is read optionally.
+ * @returns a session id → cwd map, or undefined when the layer is absent or
+ *   could not be listed.
+ */
+async function persistedSessionCwds(ctx: Context): Promise<Map<string, string> | undefined> {
+  const persistence = ctx.reflect.get('sessionPersistence', false) as
+    { list: () => Promise<Array<{ id: string; cwd?: string }>> } | undefined
+  if (persistence === undefined) return undefined
+  try {
+    const cwds = new Map<string, string>()
+    for (const meta of await persistence.list()) {
+      if (meta.cwd !== undefined) cwds.set(meta.id, meta.cwd)
+    }
+    return cwds
+  } catch (error) {
+    ctx.logger.warn('taskboard: could not list persisted sessions for reconciliation', error)
+    return undefined
+  }
+}
+
+/**
+ * Re-file issue sessions that predate workspace membership tracking.
+ *
+ * Sessions spawned before {@link startTask} attached them to their workspace
+ * still carry a cwd, but were never registered in any workspace's `sessionIds`,
+ * so the sidebar keeps them under "ungrouped" — the workspace registry's own
+ * bootstrap only repairs an uninitialized domain and never re-runs. This
+ * mount-time sweep walks every issue's bound session and attaches it to the
+ * workspace owning its cwd, exactly like a fresh spawn does now. Attach is
+ * idempotent and best-effort: an issue without a bound session, a session
+ * without a cwd, or a registry that is not ready yet are skipped or logged,
+ * never fatal.
+ *
+ * The cwd source order mirrors {@link startTask}: the issue's project
+ * workspace path first (it says where the work belongs), then the session's
+ * own cwd — read from the session persistence so long-dead sessions still
+ * count, with the live registries as the fallback.
+ * @param ctx - Context with `taskboard`; `workspaceRegistry` and
+ *   `sessionPersistence` are read optionally.
+ * @param board - The board service.
+ */
+export async function reconcileWorkspaceMembership(ctx: Context, board: Taskboard): Promise<void> {
+  const workspaces = ctx.reflect.get('workspaceRegistry', false)
+  if (workspaces === undefined) return
+  const persistedCwds = await persistedSessionCwds(ctx)
+  if (persistedCwds === undefined) return
+  for (const task of board.listTasks()) {
+    const sessionId = task.sessionId
+    if (sessionId === undefined) continue
+    const path =
+      board.getProject(task.projectId)?.workspacePath ??
+      persistedCwds?.get(sessionId) ??
+      sessionCwd(ctx, sessionId)
+    if (path === undefined) continue
+    try {
+      // Resolve only — never create here. This sweep can run while the registry
+      // is still warming up (entities not yet rebuilt), and a create in that
+      // window would mint a duplicate workspace for a path the stored domain
+      // already owns, which fails the registry's own validation on the next
+      // boot. A session whose workspace no longer exists stays ungrouped.
+      const workspace = await workspaces.resolveByPath(path).catch(() => undefined)
+      if (workspace !== undefined) await workspace.attachSession(SessionId(sessionId))
+    } catch (error) {
+      ctx.logger.warn(`taskboard: could not re-attach session ${sessionId} to its workspace`, error)
+    }
+  }
+}
+
+/**
+ * Re-file issues stranded on the fallback board into their workspace board.
+ *
+ * Issues created before `/task` resolved its board by the invoking session's
+ * workspace all landed on the fallback "Tasks" board (project id `default`).
+ * The fix only changed where NEW issues go; the ones already there stayed
+ * invisible to the board tab of the session that owns their work. This
+ * mount-time sweep walks every issue still on the fallback board whose bound
+ * session carries a cwd, resolves that cwd to its workspace, and moves the
+ * issue onto that workspace's board — comments, activity, executions, and the
+ * session binding all stay with the issue, only `projectId` changes.
+ *
+ * The cwd source is the session persistence (a dead session's cwd lives
+ * nowhere else), with the live registries as the fallback — the same order
+ * {@link reconcileWorkspaceMembership} uses. An issue without a bound session,
+ * a session without a cwd, or a cwd no workspace owns stays where it is: there
+ * is no better answer than the fallback board for it. The move is an
+ * unconditional field-scoped patch (no version fence): the sweep is a repair,
+ * and a hot issue's version bumps with every comment, so fencing against the
+ * read version would only make the repair lose races and linger. The write
+ * chain keeps the merge atomic, so nothing else on the issue can be lost.
+ *
+ * Idempotent by construction — a moved issue no longer lives on the fallback
+ * board — and best-effort: a registry that is not ready yet skips, and the
+ * mount retries ride it out.
+ * @param ctx - Context with `taskboard`; `workspaceRegistry` and
+ *   `sessionPersistence` are read optionally.
+ * @param board - The board service.
+ */
+export async function reconcileBoardOwnership(ctx: Context, board: Taskboard): Promise<void> {
+  const workspaces = ctx.reflect.get('workspaceRegistry', false)
+  if (workspaces === undefined) return
+  const fallback = board.getProject('default')
+  if (fallback === undefined) return
+  const persistedCwds = await persistedSessionCwds(ctx)
+  if (persistedCwds === undefined) return
+  for (const task of board.listTasks({ projectId: fallback.id })) {
+    const sessionId = task.sessionId
+    if (sessionId === undefined) continue
+    const path = persistedCwds.get(sessionId) ?? sessionCwd(ctx, sessionId)
+    if (path === undefined) continue
+    try {
+      // Resolve only — never create — for the same reason the membership sweep
+      // does not: this runs while the registry may still be warming up, and a
+      // create in that window would mint a duplicate workspace.
+      const workspace = await workspaces.resolveByPath(path).catch(() => undefined)
+      if (workspace === undefined) continue
+      const target = await board.projectForWorkspace(workspace.id, workspace.path, workspace.title)
+      if (target.id === fallback.id) continue
+      await board.updateTask(task.id, { projectId: target.id }, { actor: LOCAL_USER })
+      ctx.logger.info(
+        `taskboard: moved legacy issue "${task.title}" (${task.id}) to board "${target.name}"`,
+      )
+    } catch (error) {
+      ctx.logger.warn(
+        `taskboard: could not move legacy issue ${task.id} to its workspace board`,
+        error,
+      )
+    }
   }
 }
 
@@ -497,49 +841,121 @@ export function applySessionLink(ctx: Context, config: SchedulerConfig = {}): vo
   // plugin defaults, and a configure that raced ahead of the read wins over
   // the stored row).
   ctx.effect(() => {
-    void scheduler.restore().then(() => { void scheduler.pump() })
+    void scheduler.restore().then(() => {
+      void scheduler.pump()
+    })
     return () => {}
   }, 'taskboard: scheduler restore')
 
   // A board write is the usual reason a slot frees or a new issue becomes
   // eligible, so it is the primary trigger.
-  ctx.effect(() => ctx.on('domain/changed', change => {
-    if (change.domain === 'taskboard' && change.table === 'tasks') void scheduler.pump()
-  }), 'taskboard: scheduler trigger')
+  ctx.effect(
+    () =>
+      ctx.on('domain/changed', change => {
+        if (change.domain === 'taskboard' && change.table === 'tasks') void scheduler.pump()
+      }),
+    'taskboard: scheduler trigger',
+  )
 
   // Host-side cron heartbeat: runs without any tab being open. Minute-granular
   // cron checked every `tickIntervalMs`; due issues are executed for real.
   ctx.effect(() => {
-    const timer = setInterval(() => { void scheduler.tick() }, scheduler.tickIntervalMs)
-    return () => { clearInterval(timer) }
+    const timer = setInterval(() => {
+      void scheduler.tick()
+    }, scheduler.tickIntervalMs)
+    return () => {
+      clearInterval(timer)
+    }
   }, 'taskboard: scheduler cron tick')
 
   // Safety net for transitions that write nothing to the board — chiefly a
-  // session going away, which frees a slot silently.
+  // session going away, which frees a slot silently. The same beat retries
+  // pending session mail whose target has since become live again (a resumed
+  // or re-run issue session), so mail never needs a human to resend it.
   ctx.effect(() => {
-    const timer = setInterval(() => { void scheduler.pump() }, config.sweepIntervalMs ?? 30_000)
-    return () => { clearInterval(timer) }
+    const timer = setInterval(() => {
+      void scheduler.pump()
+      const undelivered = new Set(
+        board
+          .listMessages()
+          .filter(message => message.deliveredAt === undefined)
+          .map(message => message.toSessionId),
+      )
+      for (const sessionId of undelivered) {
+        void deliverPending(ctx, board, sessionId)
+      }
+    }, config.sweepIntervalMs ?? 30_000)
+    return () => {
+      clearInterval(timer)
+    }
   }, 'taskboard: scheduler sweep')
 
   // The turn boundary is also the execution boundary: a clean stop settles the
   // issue's open execution as `succeeded` (its status move is the agent's own
   // skill-driven in_review, not this listener's call).
-  ctx.effect(() => ctx.on('agent/turn-stopping', ({ agent }) => {
-    settleAgentRun(ctx, board, agent.id, 'succeeded')
-  }), 'taskboard: turn trail')
+  ctx.effect(
+    () =>
+      ctx.on('agent/turn-stopping', ({ agent }) => {
+        settleAgentRun(ctx, board, agent.id, 'succeeded')
+      }),
+    'taskboard: turn trail',
+  )
 
   // A turn that errored settles the attempt as `failed` and lands the issue in
   // the `failed` column. This fires for every turn error, including ones with
   // no in-turn position for the durable log.
-  ctx.effect(() => ctx.on('agent/error', ({ agent, error }) => {
-    const message = error instanceof Error ? error.message : String(error)
-    settleAgentRun(ctx, board, agent.id, 'failed', message)
-  }), 'taskboard: agent error trail')
+  ctx.effect(
+    () =>
+      ctx.on('agent/error', ({ agent, error }) => {
+        const message = error instanceof Error ? error.message : String(error)
+        settleAgentRun(ctx, board, agent.id, 'failed', message)
+      }),
+    'taskboard: agent error trail',
+  )
 
   // On mount, any in_progress issue whose session died while the plugin was
   // unloaded is settled as failed — otherwise it would sit "in progress" forever.
   ctx.effect(() => {
-    const timer = setTimeout(() => { void reconcileOrphans(ctx, board) }, 0)
-    return () => { clearTimeout(timer) }
+    const timer = setTimeout(() => {
+      void reconcileOrphans(ctx, board)
+    }, 0)
+    return () => {
+      clearTimeout(timer)
+    }
   }, 'taskboard: reconcile orphans')
+
+  // Backfill for sessions that predate the attach fix: they carry a cwd but
+  // were never filed into their workspace, so the sidebar shows them under
+  // "ungrouped". Retried a few times to ride out the workspace registry's
+  // asynchronous init; attach is idempotent, so repeats are harmless.
+  ctx.effect(() => {
+    const timers = [0, 2_000, 8_000].map(delay =>
+      setTimeout(() => {
+        void reconcileWorkspaceMembership(ctx, board).catch((error: unknown) => {
+          ctx.logger.warn('taskboard: workspace membership reconciliation failed', error)
+        })
+      }, delay),
+    )
+    return () => {
+      for (const timer of timers) clearTimeout(timer)
+    }
+  }, 'taskboard: workspace membership reconcile')
+
+  // Backfill for issues stranded on the fallback "Tasks" board before /task
+  // resolved its board by workspace: each one is re-filed onto the board of
+  // the workspace its bound session's cwd belongs to. Same retry ladder as
+  // the membership sweep (the registry warms up asynchronously); the move is
+  // idempotent — a moved issue is no longer on the fallback board.
+  ctx.effect(() => {
+    const timers = [0, 2_000, 8_000].map(delay =>
+      setTimeout(() => {
+        void reconcileBoardOwnership(ctx, board).catch((error: unknown) => {
+          ctx.logger.warn('taskboard: board ownership reconciliation failed', error)
+        })
+      }, delay),
+    )
+    return () => {
+      for (const timer of timers) clearTimeout(timer)
+    }
+  }, 'taskboard: board ownership reconcile')
 }

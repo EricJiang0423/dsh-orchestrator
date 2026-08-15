@@ -17,11 +17,11 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import { applyCommand } from './command.ts'
 import { applyPlanLoop, type PlanLoopConfig } from './plan-loop.ts'
 import { applyRpc } from './rpc.ts'
-import { applySessionLink } from './session-link.ts'
-import type { SchedulerConfig } from './wire.ts'
-import { applyTools } from './tools.ts'
 import { Taskboard } from './service.ts'
+import { applySessionLink } from './session-link.ts'
 import { applySkill } from './skill.ts'
+import { applyTools } from './tools.ts'
+import type { SchedulerConfig } from './wire.ts'
 
 export * from './domain.ts'
 export * from './wire.ts'
@@ -84,18 +84,23 @@ export function apply(ctx: Context, config: Config): void {
   // A concise pointer, not the skill body: the skill carries the how; this tells
   // the model it is working inside a board so it checks before assuming otherwise.
   ctx.inject(['systemPrompt'], promptCtx => {
-    promptCtx.effect(() => promptCtx.systemPrompt.section({
-      name: 'plugin:taskboard',
-      order: 200,
-      text: [
-        'This deployment includes dsh-orchestrator, a local task board.',
-        'Issues on it have an id and a status; an agent works an issue by claiming it',
-        '(taskboard_update to in_progress), commenting as it goes (taskboard_comment),',
-        'and handing it back in_review — never done, which only a human can accept.',
-        'New work is proposed (taskboard_propose), not started. When the user refers',
-        'to "the board" or an issue, use the taskboard_* tools.',
-      ].join(' '),
-    }), 'taskboard: guidance')
+    promptCtx.effect(
+      () =>
+        promptCtx.systemPrompt.section({
+          name: 'plugin:taskboard',
+          order: 200,
+          text: [
+            'This deployment includes dsh-orchestrator, a local task board.',
+            'Issues on it have an id and a status; an agent works an issue by claiming it',
+            '(taskboard_update to in_progress), commenting as it goes (taskboard_comment),',
+            'and handing it back in_review — never done and never archieved: accepting',
+            'and archiving are human acts.',
+            'New work is proposed (taskboard_propose), not started. When the user refers',
+            'to "the board" or an issue, use the taskboard_* tools.',
+          ].join(' '),
+        }),
+      'taskboard: guidance',
+    )
   })
 
   // Human-facing face: present wherever a command adapter is.
@@ -103,10 +108,9 @@ export function apply(ctx: Context, config: Config): void {
 
   // Planning loop: needs the workflow engine and a fresh subagent provider,
   // so a composition without them keeps the board and simply has no loop.
-  ctx.inject(
-    ['tools', 'taskboard', 'workflowEngine', 'subagents'],
-    loopCtx => { applyPlanLoop(loopCtx, config.plan) },
-  )
+  ctx.inject(['tools', 'taskboard', 'workflowEngine', 'subagents'], loopCtx => {
+    applyPlanLoop(loopCtx, config.plan)
+  })
 
   // Issue↔session trail and the scheduler, wherever an agent registry exists.
   // Wrapped: cordis types the inject callback's second parameter as the service

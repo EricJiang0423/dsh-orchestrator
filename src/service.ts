@@ -23,10 +23,12 @@ import {
   type CommentId,
   type ExecutionRecord,
   type ExecutionResult,
+  type MessageId,
   type Project,
   type ProjectId,
   type SchedulerSettings,
   type ScheduleRule,
+  type SessionMessage,
   type SettingsKey,
   type Task,
   type TaskId,
@@ -42,10 +44,7 @@ declare module '@deepseek-ai/cordis' {
 
 /** Why a board write was refused. */
 export type TaskboardErrorCode =
-  | 'not-found'
-  | 'version-conflict'
-  | 'forbidden-transition'
-  | 'invalid-input'
+  'not-found' | 'version-conflict' | 'forbidden-transition' | 'forbidden' | 'invalid-input'
 
 /** A refused board write. Carries a code the RPC and tool layers map to their own shapes. */
 export class TaskboardError extends Error {
@@ -53,7 +52,10 @@ export class TaskboardError extends Error {
    * @param code - Machine-readable reason.
    * @param message - Human-readable detail.
    */
-  constructor(readonly code: TaskboardErrorCode, message: string) {
+  constructor(
+    readonly code: TaskboardErrorCode,
+    message: string,
+  ) {
     super(message)
     this.name = 'TaskboardError'
   }
@@ -82,7 +84,14 @@ export interface CreateTaskInput {
   proposedBy?: Task['proposedBy']
 }
 
-/** Fields a caller may change on an issue. `version` is managed, not patched. */
+/**
+ * Fields a caller may change on an issue. `version` is managed, not patched.
+ *
+ * `projectId` is the cross-board move: changing it re-files the issue on
+ * another project's board (comments, activity, executions, and the bound
+ * session all stay with the issue). A moved issue keeps its version chain, so
+ * concurrent writers are still fenced the usual way.
+ */
 export type UpdateTaskPatch = Partial<
   Pick<
     Task,
@@ -97,6 +106,7 @@ export type UpdateTaskPatch = Partial<
     | 'relations'
     | 'sessionId'
     | 'sortKey'
+    | 'projectId'
   >
 >
 
@@ -135,6 +145,7 @@ export class Taskboard extends Service {
   private tasks!: KvTable<TaskId, Task>
   private comments!: KvTable<CommentId, Comment>
   private activities!: KvTable<ActivityId, Activity>
+  private messages!: KvTable<MessageId, SessionMessage>
   private settings!: KvTable<SettingsKey, SchedulerSettings>
 
   /** @param ctx - Plugin context carrying the domain facility. */
@@ -142,14 +153,16 @@ export class Taskboard extends Service {
     super(ctx, 'taskboard')
   }
 
-  /** Open the board domain and bind its five table handles. */
+  /** Open the board domain and bind its six table handles. */
   async [Service.init](): Promise<void> {
-    const domain: Domain<typeof taskboardDomain> = await this.ctx.storageDomain.open(taskboardDomain)
+    const domain: Domain<typeof taskboardDomain> =
+      await this.ctx.storageDomain.open(taskboardDomain)
     this.ctx.effect(() => () => void domain.close(), 'taskboard: domain close')
     this.projects = domain.table('projects')
     this.tasks = domain.table('tasks')
     this.comments = domain.table('comments')
     this.activities = domain.table('activities')
+    this.messages = domain.table('messages')
     this.settings = domain.table('settings')
   }
 
@@ -234,10 +247,15 @@ export class Taskboard extends Service {
    * @param patch - Fields to change; omitted fields keep their stored value.
    * @returns the stored record.
    */
-  async setSchedulerSettings(patch: { concurrency?: number; autoPull?: boolean }): Promise<SchedulerSettings> {
+  async setSchedulerSettings(patch: {
+    concurrency?: number
+    autoPull?: boolean
+  }): Promise<SchedulerSettings> {
     const current = await this.settings.get(SCHEDULER_SETTINGS_KEY)
     const next: SchedulerSettings = {
-      concurrency: patch.concurrency ?? current?.concurrency ?? 1,
+      // DEFAULT_CONCURRENCY: the out-of-the-box parallel width is 5, not 1 —
+      // the board is an orchestrator, so it should fan out by default.
+      concurrency: patch.concurrency ?? current?.concurrency ?? 5,
       autoPull: patch.autoPull ?? current?.autoPull ?? true,
       updatedAt: new Date().toISOString(),
     }
@@ -253,15 +271,19 @@ export class Taskboard extends Service {
    * @returns the matching issues.
    */
   listTasks(filter: TaskFilter = {}): Task[] {
-    const statuses = filter.status === undefined
-      ? undefined
-      : new Set(typeof filter.status === 'string' ? [filter.status] : filter.status)
+    const statuses =
+      filter.status === undefined
+        ? undefined
+        : new Set(typeof filter.status === 'string' ? [filter.status] : filter.status)
     return [...this.tasks.entries()]
       .map(([, task]) => task)
-      .filter(task => (filter.projectId === undefined || task.projectId === filter.projectId)
-        && (statuses === undefined || statuses.has(task.status))
-        && (filter.sessionId === undefined || task.sessionId === filter.sessionId))
-      .sort((a, b) => (Number(a.sortKey) - Number(b.sortKey)) || a.id.localeCompare(b.id))
+      .filter(
+        task =>
+          (filter.projectId === undefined || task.projectId === filter.projectId) &&
+          (statuses === undefined || statuses.has(task.status)) &&
+          (filter.sessionId === undefined || task.sessionId === filter.sessionId),
+      )
+      .sort((a, b) => Number(a.sortKey) - Number(b.sortKey) || a.id.localeCompare(b.id))
   }
 
   /** One issue. @param id - Task id. @returns the issue, or undefined. */
@@ -296,9 +318,11 @@ export class Taskboard extends Service {
           `task "${id}" is at version ${current.version}, not ${opts.expectedVersion}`,
         )
       }
-      if (opts.status !== undefined
-        && opts.status !== current.status
-        && !canTransition(current.status, opts.status, opts.actor.type)) {
+      if (
+        opts.status !== undefined &&
+        opts.status !== current.status &&
+        !canTransition(current.status, opts.status, opts.actor.type)
+      ) {
         throw new TaskboardError(
           'forbidden-transition',
           `${opts.actor.type} may not move "${current.status}" to "${opts.status}"`,
@@ -313,7 +337,9 @@ export class Taskboard extends Service {
         ...current,
         executions: [...current.executions, execution],
         sessionId,
-        ...(opts.status !== undefined && opts.status !== current.status ? { status: opts.status } : {}),
+        ...(opts.status !== undefined && opts.status !== current.status
+          ? { status: opts.status }
+          : {}),
         version: current.version + 1,
         updatedAt: new Date().toISOString(),
       }
@@ -365,7 +391,9 @@ export class Taskboard extends Service {
       const next: Task = {
         ...current,
         executions,
-        ...(opts.status !== undefined && opts.status !== current.status ? { status: opts.status } : {}),
+        ...(opts.status !== undefined && opts.status !== current.status
+          ? { status: opts.status }
+          : {}),
         version: current.version + 1,
         updatedAt: new Date().toISOString(),
       }
@@ -418,7 +446,9 @@ export class Taskboard extends Service {
         // scan horizon; a disabled rule carries neither the due instant nor a
         // stale one from storage.
         ...(nextRunAt !== undefined ? { nextRunAt } : {}),
-        ...(current?.lastTriggeredAt !== undefined ? { lastTriggeredAt: current.lastTriggeredAt } : {}),
+        ...(current?.lastTriggeredAt !== undefined
+          ? { lastTriggeredAt: current.lastTriggeredAt }
+          : {}),
       }
       return { ...stored, schedule, version: stored.version + 1, updatedAt: now }
     })
@@ -492,7 +522,9 @@ export class Taskboard extends Service {
       updatedAt: now,
     }
     await this.tasks.put(id, task)
-    await this.record(id, task.status === 'proposed' ? 'proposed' : 'created', creator, { title: task.title })
+    await this.record(id, task.status === 'proposed' ? 'proposed' : 'created', creator, {
+      title: task.title,
+    })
     return task
   }
 
@@ -514,13 +546,15 @@ export class Taskboard extends Service {
   ): Promise<Task> {
     const before = this.tasks.get(id as TaskId)
     if (before === undefined) throw new TaskboardError('not-found', `task "${id}" does not exist`)
-    if (patch.status !== undefined && !canTransition(before.status, patch.status, opts.actor.type)) {
+    if (
+      patch.status !== undefined &&
+      !canTransition(before.status, patch.status, opts.actor.type)
+    ) {
       throw new TaskboardError(
         'forbidden-transition',
         `${opts.actor.type} may not move "${before.status}" to "${patch.status}"`,
       )
     }
-
     // `null` must never reach the medium: the domain rejects it at open
     // (`invalid-record`), which would take the whole board down on the next
     // boot. `undefined` is the "clear this optional field" spelling — JSON
@@ -533,7 +567,19 @@ export class Taskboard extends Service {
         if (CLEARABLE_TASK_FIELDS.has(key)) (cleaned as Record<string, unknown>)[key] = undefined
         continue
       }
-      (cleaned as Record<string, unknown>)[key] = value
+      ;(cleaned as Record<string, unknown>)[key] = value
+    }
+
+    // A cross-board move must land somewhere that exists — a dangling projectId
+    // would strand the issue where no board can render it. Checked on the
+    // CLEANED patch, so a null (the "clear this field" spelling) is dropped
+    // like every other non-clearable field instead of being read as a board id.
+    if (
+      cleaned.projectId !== undefined &&
+      cleaned.projectId !== before.projectId &&
+      this.projects.get(cleaned.projectId as ProjectId) === undefined
+    ) {
+      throw new TaskboardError('not-found', `project "${cleaned.projectId}" does not exist`)
     }
 
     const next = await this.tasks.update(id as TaskId, current => {
@@ -543,13 +589,68 @@ export class Taskboard extends Service {
           `task "${id}" is at version ${current.version}, not ${opts.expectedVersion}`,
         )
       }
-      return { ...current, ...cleaned, version: current.version + 1, updatedAt: new Date().toISOString() }
+      return {
+        ...current,
+        ...cleaned,
+        version: current.version + 1,
+        updatedAt: new Date().toISOString(),
+      }
     })
 
     if (patch.status !== undefined && patch.status !== before.status) {
-      await this.record(id as TaskId, 'status', opts.actor, { from: before.status, to: patch.status })
+      await this.record(id as TaskId, 'status', opts.actor, {
+        from: before.status,
+        to: patch.status,
+      })
+    }
+    if (cleaned.projectId !== undefined && cleaned.projectId !== before.projectId) {
+      await this.record(id as TaskId, 'moved', opts.actor, {
+        from: before.projectId,
+        to: cleaned.projectId,
+      })
     }
     return next
+  }
+
+  // ── delete ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Remove an issue and everything that referenced it.
+   *
+   * Deleting is a human act, the same fence as acceptance and archiving: an
+   * agent must never be able to erase an issue or the trace of it, so this
+   * method refuses any non-`user` actor at the service boundary — no tool or
+   * planning loop can reach it, whatever the caller's plumbing looks like.
+   *
+   * The task row goes first; the comments and activity rows that referenced
+   * it go with it, because they become unreachable the moment the issue is
+   * gone (no list path can surface them) and an invisible row is just storage
+   * rot. Session mail is NOT deleted: a message can involve two issues or
+   * outlive either of them, so it stays as the mail trail.
+   *
+   * Unlike {@link updateTask}, a missing issue is not an error — "already
+   * gone" is the desired end state, so a double-click or a second tab's
+   * delete answers `false` instead of raising. The domain's `delete` already
+   * returns exactly that boolean.
+   * @param id - Task id.
+   * @param opts - Who is deleting; only `user` actors pass the fence.
+   * @returns `true` when the issue existed and was removed, `false` when it
+   *   was already gone.
+   */
+  async deleteTask(id: string, opts: { actor: Actor }): Promise<boolean> {
+    if (opts.actor.type !== 'user') {
+      throw new TaskboardError('forbidden', 'only a user may delete an issue')
+    }
+    const existed = await this.tasks.delete(id as TaskId)
+    if (!existed) return false
+    // The tables iterate over a snapshot, so deleting while iterating is safe.
+    for (const [commentId, comment] of this.comments.entries()) {
+      if (comment.taskId === id) await this.comments.delete(commentId)
+    }
+    for (const [activityId, row] of this.activities.entries()) {
+      if (row.taskId === id) await this.activities.delete(activityId)
+    }
+    return true
   }
 
   // ── comments and activity ─────────────────────────────────────────────────
@@ -590,6 +691,96 @@ export class Taskboard extends Service {
       .map(([, activity]) => activity)
       .filter(activity => activity.taskId === taskId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+
+  // ── session mail ──────────────────────────────────────────────────────────
+
+  /**
+   * Store one inter-session agent message.
+   * @param input - Endpoints, attribution, and body.
+   * @returns the stored message (delivery is a separate, live-agent step).
+   */
+  async postMessage(input: {
+    projectId: string
+    fromSessionId: string
+    fromAgent: Actor
+    toSessionId: string
+    toIssueId: string
+    fromIssueId?: string
+    body: string
+  }): Promise<SessionMessage> {
+    if (input.body.trim() === '') {
+      throw new TaskboardError('invalid-input', 'message body is empty')
+    }
+    if (input.fromSessionId === input.toSessionId) {
+      throw new TaskboardError('invalid-input', 'a session cannot message itself')
+    }
+    const message: SessionMessage = {
+      id: crypto.randomUUID(),
+      projectId: input.projectId,
+      fromSessionId: input.fromSessionId,
+      fromAgent: input.fromAgent,
+      ...(input.fromIssueId !== undefined ? { fromIssueId: input.fromIssueId } : {}),
+      toSessionId: input.toSessionId,
+      toIssueId: input.toIssueId,
+      body: input.body,
+      createdAt: new Date().toISOString(),
+    }
+    await this.messages.put(message.id as MessageId, message)
+    return message
+  }
+
+  /**
+   * Messages matching any given endpoint. Omitted fields do not constrain;
+   * when several are given the match is an OR across them (a message belongs to
+   * every endpoint it touches).
+   * @param filter - project / session / issue involvement.
+   * @returns matching messages, oldest first.
+   */
+  listMessages(
+    filter: { projectId?: string; sessionId?: string; issueId?: string } = {},
+  ): SessionMessage[] {
+    return [...this.messages.entries()]
+      .map(([, message]) => message)
+      .filter(
+        message =>
+          (filter.projectId === undefined || message.projectId === filter.projectId) &&
+          (filter.sessionId === undefined ||
+            message.fromSessionId === filter.sessionId ||
+            message.toSessionId === filter.sessionId) &&
+          (filter.issueId === undefined ||
+            message.fromIssueId === filter.issueId ||
+            message.toIssueId === filter.issueId),
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+
+  /** Every message an issue is involved in, by its id or its bound session. */
+  messagesFor(task: Task): SessionMessage[] {
+    const id = task.id
+    const sessionId = task.sessionId
+    return [...this.messages.entries()]
+      .map(([, message]) => message)
+      .filter(
+        message =>
+          message.fromIssueId === id ||
+          message.toIssueId === id ||
+          (sessionId !== undefined &&
+            (message.fromSessionId === sessionId || message.toSessionId === sessionId)),
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+
+  /**
+   * Mark a message as delivered into the target agent's inbox.
+   * @param id - Message id.
+   * @returns the updated message.
+   */
+  async markDelivered(id: string): Promise<SessionMessage> {
+    return this.messages.update(id as MessageId, message => ({
+      ...message,
+      deliveredAt: new Date().toISOString(),
+    }))
   }
 
   /**

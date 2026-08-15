@@ -31,14 +31,14 @@
 
 ## 功能特性
 
-| 特性 | 说明 |
-|---|---|
-| 每个仓库一块看板 | 看板绑定会话的工作目录而不是对话本身：同一仓库的两个会话共享一块板，另一个仓库的会话看到自己的板——归属由宿主解析，浏览器端永远不会把不同项目的 issue 混在一起 |
-| 每个 issue 一个独立会话 | 「Work on this」会为这个 issue 新建一个独立会话并把 brief 交给它，issue 与它绑定，每个 issue 的对话记录和成本都各自独立——也因此可以多个同时跑 |
-| 自动拉取调度器 | 调度器维持最多 N 个进行中的 issue，并自行从 `todo` 按优先级补位；并行度和自动拉取开关在看板头部实时可调 |
-| 两道人工关口 | agent 永远不能把 issue 移出 `proposed`，也永远不能把自己标成 `done`：提案需要你批准，完成的工作需要你验收——都在服务层强制，不是 UI 上的约定 |
-| 持久化审批队列 | agent 提出的 issue 落在 `proposed` 列，等真人批准或拒绝——跨重启持久保存，不像一次性审批弹窗那样会丢 |
-| 看板是聊天的平级页签 | 看板注册进 conversation view ring，作为 Chat / Trajectory 旁边的一个页签出现，而不是独立页面 |
+| 特性                    | 说明                                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 每个仓库一块看板        | 看板绑定会话的工作目录而不是对话本身：同一仓库的两个会话共享一块板，另一个仓库的会话看到自己的板——归属由宿主解析，浏览器端永远不会把不同项目的 issue 混在一起 |
+| 每个 issue 一个独立会话 | 「Work on this」会为这个 issue 新建一个独立会话并把 brief 交给它，issue 与它绑定，每个 issue 的对话记录和成本都各自独立——也因此可以多个同时跑                 |
+| 自动拉取调度器          | 调度器维持最多 N 个进行中的 issue，并自行从 `todo` 按优先级补位；并行度和自动拉取开关在看板头部实时可调                                                       |
+| 两道人工关口            | agent 永远不能把 issue 移出 `proposed`，也永远不能把自己标成 `done`：提案需要你批准，完成的工作需要你验收——都在服务层强制，不是 UI 上的约定                   |
+| 持久化审批队列          | agent 提出的 issue 落在 `proposed` 列，等真人批准或拒绝——跨重启持久保存，不像一次性审批弹窗那样会丢                                                           |
+| 看板是聊天的平级页签    | 看板注册进 conversation view ring，作为 Chat / Trajectory 旁边的一个页签出现，而不是独立页面                                                                  |
 
 ---
 
@@ -73,6 +73,8 @@ cd dsh-orchestrator
 npm install && npm run build
 dsh plugin --profile web add .
 ```
+
+`lib/` 是被 gitignore 的构建产物。`npm test` 会在它缺失时自动先构建（`pretest` 钩子会先跑 `npm run build`），因此干净 clone 里 `npm install` 之后无需手动构建就能直接跑测试。一旦 `lib/` 已存在，`npm test` 会跳过重建以保持快速——想测最新源码改动时请显式执行 `npm run build`。
 
 ### 从 npm 安装（registry）
 
@@ -167,15 +169,15 @@ graph LR
 
 ## 配置
 
-| 键 | 默认值 | 说明 |
-|---|---|---|
-| `scheduler.concurrency` | `1` | 同时进行中的 issue 数；可在看板头部实时修改 |
-| `scheduler.autoPull` | `true` | 是否自动从 `todo` 拉取开工；可在看板头部实时开关 |
-| `scheduler.sweepIntervalMs` | `30000` | 安全网清扫间隔：回收被消失的会话占用的槽位 |
-| `plan.subagentProvider` | `spawn` | 每轮规划使用的全新结构化输出子 agent provider |
-| `plan.maxRounds` | `32` | 单次 `taskboard_plan` 的默认值兼上限；调用方可调低，不可调高 |
-| `plan.maxHandoffChars` | `16384` | 单轮结构化报告的最大序列化字符数；超限直接判失败而不是截断 |
-| `plan.maxIssues` | `16` | 单次规划运行最多纳入的 issue 数 |
+| 键                          | 默认值  | 说明                                                         |
+| --------------------------- | ------- | ------------------------------------------------------------ |
+| `scheduler.concurrency`     | `1`     | 同时进行中的 issue 数；可在看板头部实时修改                  |
+| `scheduler.autoPull`        | `true`  | 是否自动从 `todo` 拉取开工；可在看板头部实时开关             |
+| `scheduler.sweepIntervalMs` | `30000` | 安全网清扫间隔：回收被消失的会话占用的槽位                   |
+| `plan.subagentProvider`     | `spawn` | 每轮规划使用的全新结构化输出子 agent provider                |
+| `plan.maxRounds`            | `32`    | 单次 `taskboard_plan` 的默认值兼上限；调用方可调低，不可调高 |
+| `plan.maxHandoffChars`      | `16384` | 单轮结构化报告的最大序列化字符数；超限直接判失败而不是截断   |
+| `plan.maxIssues`            | `16`    | 单次规划运行最多纳入的 issue 数                              |
 
 ---
 
@@ -183,21 +185,21 @@ graph LR
 
 浏览器端与宿主端通过一个端点通信：`POST /_dsh/taskboard/rpc`，请求体为 `{ method, params }`，而不是每个资源一条 REST 路径。DeepSeek Harness 的类型化 RPC 层需要构建期代码生成，而本插件的构建不跑这一步，所以路由刻意保持显式——原因见 [docs/spike-findings.md](docs/spike-findings.md)。
 
-| 方法 | 说明 |
-|---|---|
-| `board.view` | 当前会话所属的看板（按工作区解析），附带实时调度器状态 |
-| `project.list` | 列出所有项目 |
-| `project.create` | 创建项目 |
-| `task.list` | 列出 issue，可按项目、状态或会话过滤 |
-| `task.get` | 读取单个 issue 及其评论与活动流水 |
-| `task.create` | 创建 issue |
-| `task.update` | 修改 issue；过期的 `expectedVersion` 会被拒绝 |
-| `comment.create` | 给 issue 加评论 |
-| `task.start` | 为单个 issue 新建一个独立会话并把活交给它 |
-| `task.startNext` | 不指名地开工下一个 `todo` issue——优先级最高者优先 |
-| `task.accept` | 验收完成的工作（`in_review` → `done`）——agent 无法越过的人工关口 |
-| `task.sendBack` | 把完成的工作打回 `todo` 并附理由（落成一条评论），同时解绑其会话 |
-| `scheduler.configure` | 修改并行度或自动拉取开关；返回修改后的状态 |
+| 方法                  | 说明                                                             |
+| --------------------- | ---------------------------------------------------------------- |
+| `board.view`          | 当前会话所属的看板（按工作区解析），附带实时调度器状态           |
+| `project.list`        | 列出所有项目                                                     |
+| `project.create`      | 创建项目                                                         |
+| `task.list`           | 列出 issue，可按项目、状态或会话过滤                             |
+| `task.get`            | 读取单个 issue 及其评论与活动流水                                |
+| `task.create`         | 创建 issue                                                       |
+| `task.update`         | 修改 issue；过期的 `expectedVersion` 会被拒绝                    |
+| `comment.create`      | 给 issue 加评论                                                  |
+| `task.start`          | 为单个 issue 新建一个独立会话并把活交给它                        |
+| `task.startNext`      | 不指名地开工下一个 `todo` issue——优先级最高者优先                |
+| `task.accept`         | 验收完成的工作（`in_review` → `done`）——agent 无法越过的人工关口 |
+| `task.sendBack`       | 把完成的工作打回 `todo` 并附理由（落成一条评论），同时解绑其会话 |
+| `scheduler.configure` | 修改并行度或自动拉取开关；返回修改后的状态                       |
 
 变更通知通过 `GET /_dsh/taskboard/events` 以 Server-Sent Events 推送。
 
@@ -234,20 +236,20 @@ docs/                     # 扩展点调研笔记
 
 ### 运行时
 
-| 技术 | 用途 |
-|---|---|
-| TypeScript | 插件两端（宿主/浏览器）的源码语言 |
-| Cordis | 宿主插件框架：service、effect、依赖注入 |
-| Zod | 四个 storage-domain 表的 schema 校验 |
-| Schemastery | 插件 `Config` 校验 |
-| React | 看板视图渲染（peer 依赖，运行时由宿主提供） |
+| 技术        | 用途                                        |
+| ----------- | ------------------------------------------- |
+| TypeScript  | 插件两端（宿主/浏览器）的源码语言           |
+| Cordis      | 宿主插件框架：service、effect、依赖注入     |
+| Zod         | 四个 storage-domain 表的 schema 校验        |
+| Schemastery | 插件 `Config` 校验                          |
+| React       | 看板视图渲染（peer 依赖，运行时由宿主提供） |
 
 ### 构建与测试
 
-| 技术 | 用途 |
-|---|---|
-| esbuild | 把浏览器端打进宿主提供的 client-module envelope |
-| Node.js test runner | `node --test`，无测试框架依赖 |
+| 技术                | 用途                                            |
+| ------------------- | ----------------------------------------------- |
+| esbuild             | 把浏览器端打进宿主提供的 client-module envelope |
+| Node.js test runner | `node --test`，无测试框架依赖                   |
 
 ---
 

@@ -21,7 +21,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
-      # postinstall (patch-pi-ai-deepseek-reasoning etc.) runs here; a patch
+      # postinstall (the client-bundle patch scripts) runs here; a patch
       # that no longer applies fails this step instead of degrading silently.
       - run: npm ci
 

@@ -20,7 +20,10 @@ export class RpcError extends Error {
    * @param code - The host's error code.
    * @param message - Human-readable detail.
    */
-  constructor(readonly code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
     super(message)
     this.name = 'RpcError'
   }
@@ -42,9 +45,8 @@ export async function call<M extends TaskboardMethod>(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ method, params }),
   })
-  const body = await response.json() as
-    | { ok: true; result: ResultOf<M> }
-    | { ok: false; code: string; message: string }
+  const body = (await response.json()) as
+    { ok: true; result: ResultOf<M> } | { ok: false; code: string; message: string }
   if (!body.ok) throw new RpcError(body.code, body.message)
   return body.result
 }
@@ -67,5 +69,7 @@ export function subscribe(onChange: (change: TaskboardChange) => void): () => vo
       // A malformed frame is not worth tearing the stream down for.
     }
   }
-  return () => { source.close() }
+  return () => {
+    source.close()
+  }
 }

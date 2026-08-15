@@ -89,12 +89,17 @@ TypeScript 类型定义，手动保持两侧一致——实际类型安全等价
 注册形状（照 ui-trajectory 的先例）：
 
 ```ts
-ctx.slots.inject('conversation.view', () => ctx.slots.register({
-  name: 'conversation.view',
-  id: 'taskboard',
-  order: 20,
-  label: () => 'Taskboard',
-}, BoardView))
+ctx.slots.inject('conversation.view', () =>
+  ctx.slots.register(
+    {
+      name: 'conversation.view',
+      id: 'taskboard',
+      order: 20,
+      label: () => 'Taskboard',
+    },
+    BoardView,
+  ),
+)
 ```
 
 **作用域是 `session`**：每个会话都有一个看板页签。这跟 Phase 4「issue ↔ 会话绑定」正好互相成全——
@@ -152,12 +157,12 @@ vision-toolkit 证明了单包双面是可行且更省的：同一个 package.js
 
 `dsh --profile taskboard-dev --port 3099` 启动后：
 
-| 检查 | 结果 |
-|---|---|
-| `GET /_dsh/taskboard/spike` | `200` `{"ok":true,"plugin":"dsh-orchestrator"}` |
-| `GET /plugins/dsh-orchestrator/client.js` | `200`，1105 bytes |
-| 首页 `window.__DSH_BOOT__` | 含 `{"id":"dsh-orchestrator","url":"/plugins/dsh-orchestrator/client.js?rev=84defa20d95b"}` |
-| 浏览器 console | `[taskboard] browser plugin loaded` |
-| 会话头部页签栏 | `Chat \| Trajectory \| Taskboard`，切到 Taskboard 正常渲染，输入框保留 |
+| 检查                                      | 结果                                                                                        |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `GET /_dsh/taskboard/spike`               | `200` `{"ok":true,"plugin":"dsh-orchestrator"}`                                             |
+| `GET /plugins/dsh-orchestrator/client.js` | `200`，1105 bytes                                                                           |
+| 首页 `window.__DSH_BOOT__`                | 含 `{"id":"dsh-orchestrator","url":"/plugins/dsh-orchestrator/client.js?rev=84defa20d95b"}` |
+| 浏览器 console                            | `[taskboard] browser plugin loaded`                                                         |
+| 会话头部页签栏                            | `Chat \| Trajectory \| Taskboard`，切到 Taskboard 正常渲染，输入框保留                      |
 
 四项全部通过，Phase 0 结束。

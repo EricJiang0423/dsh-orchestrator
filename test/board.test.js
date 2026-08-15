@@ -8,11 +8,19 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Context, Service } from '@deepseek-ai/cordis'
-import { Taskboard, TaskboardError, canTransition } from '../lib/index.js'
-import {
-  Scheduler, reconcileOrphans, resolveProject, selectionRefFor, startNextTask, startTask,
-} from '../lib/session-link.js'
+import { applyCommand } from '../lib/command.js'
+import { Taskboard, TaskboardError, canTransition, isTaskStatus } from '../lib/index.js'
 import { nextRunAtMs } from '../lib/schedule.js'
+import {
+  Scheduler,
+  reconcileBoardOwnership,
+  reconcileOrphans,
+  reconcileWorkspaceMembership,
+  resolveProject,
+  selectionRefFor,
+  startNextTask,
+  startTask,
+} from '../lib/session-link.js'
 
 /** One table over a Map, with the domain's write-chain semantics. */
 function fakeTable() {
@@ -20,22 +28,31 @@ function fakeTable() {
   let chain = Promise.resolve()
   const enqueue = fn => {
     const next = chain.then(fn, fn)
-    chain = next.then(() => {}, () => {})
+    chain = next.then(
+      () => {},
+      () => {},
+    )
     return next
   }
   return {
     get: key => records.get(key),
     entries: () => [...records.entries()][Symbol.iterator](),
     keys: () => [...records.keys()][Symbol.iterator](),
-    get size() { return records.size },
-    put: (key, value) => enqueue(() => { records.set(key, value) }),
+    get size() {
+      return records.size
+    },
+    put: (key, value) =>
+      enqueue(() => {
+        records.set(key, value)
+      }),
     delete: key => enqueue(() => records.delete(key)),
-    update: (key, fn) => enqueue(() => {
-      if (!records.has(key)) throw new Error('missing-key')
-      const next = fn(records.get(key))
-      records.set(key, next)
-      return next
-    }),
+    update: (key, fn) =>
+      enqueue(() => {
+        if (!records.has(key)) throw new Error('missing-key')
+        const next = fn(records.get(key))
+        records.set(key, next)
+        return next
+      }),
   }
 }
 
@@ -63,36 +80,58 @@ async function boardFixture(options = {}) {
     // hands out fresh agents, `get` answers the live ones, `kill` makes one
     // vanish the way a closed/crashed session does — no board write involved.
     class Agents extends Service {
-      constructor(context) { super(context, 'agents') }
+      constructor(context) {
+        super(context, 'agents')
+      }
       entries = []
       create(options) {
         const agent = { id: String(options.sessionId), followups: [] }
-        agent.followup = message => { agent.followups.push(message) }
+        agent.followup = message => {
+          agent.followups.push(message)
+        }
         this.entries.push({ options, agent })
         return { agent }
       }
-      get(id) { return this.entries.find(entry => entry.agent.id === id)?.agent }
-      kill(id) { this.entries = this.entries.filter(entry => entry.agent.id !== id) }
+      get(id) {
+        return this.entries.find(entry => entry.agent.id === id)?.agent
+      }
+      kill(id) {
+        this.entries = this.entries.filter(entry => entry.agent.id !== id)
+      }
     }
     class Goals extends Service {
-      constructor(context) { super(context, 'goals') }
+      constructor(context) {
+        super(context, 'goals')
+      }
       created = []
-      create(_agent, request) { this.created.push(request) }
+      create(_agent, request) {
+        this.created.push(request)
+      }
     }
     // The harness's default model selection — spawned issue sessions must
     // inherit it (provider, model, AND reasoning effort), or their request
     // routing falls back to the adapter default instead of the user's choice.
     class DefaultModel extends Service {
-      constructor(context) { super(context, 'agentDefaultModel') }
-      currentSelection() { return { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'max' } }
+      constructor(context) {
+        super(context, 'agentDefaultModel')
+      }
+      currentSelection() {
+        return { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'max' }
+      }
     }
     // The default agent preset — without it a spawned session has no working
     // tool kit (no file tools, no shell), so it cannot do the work.
     class Presets extends Service {
-      constructor(context) { super(context, 'agentPresets') }
+      constructor(context) {
+        super(context, 'agentPresets')
+      }
       mounts = []
-      async resolve() { return { id: 'standard' } }
-      async mount(ctx, id) { this.mounts.push({ ctx, id }) }
+      async resolve() {
+        return { id: 'standard' }
+      }
+      async mount(ctx, id) {
+        this.mounts.push({ ctx, id })
+      }
     }
     ctx.plugin(Agents)
     ctx.plugin(Goals)
@@ -103,23 +142,77 @@ async function boardFixture(options = {}) {
     // The session store (main conversations) and the workspace registry, so the
     // workspace-resolution path runs without a real harness.
     class Sessions extends Service {
-      constructor(context) { super(context, 'sessions') }
-      get(id) { return id === 'session-view' ? { header: { cwd: '/repo' } } : undefined }
+      constructor(context) {
+        super(context, 'sessions')
+      }
+      get(id) {
+        return id === 'session-view' ? { header: { cwd: '/repo' } } : undefined
+      }
     }
     class Workspaces extends Service {
-      constructor(context) { super(context, 'workspaceRegistry') }
-      async resolveByPath(path) {
-        return path === '/repo' ? { id: 'ws-1', path: '/repo', title: 'Sample Repo' } : undefined
+      constructor(context) {
+        super(context, 'workspaceRegistry')
       }
-      async create(path) { return { id: 'ws-2', path, title: 'Other' } }
+      attached = []
+      attach(sessionId) {
+        this.attached.push(String(sessionId))
+      }
+      async resolveByPath(path) {
+        return path === '/repo'
+          ? {
+              id: 'ws-1',
+              path: '/repo',
+              title: 'Sample Repo',
+              attachSession: sessionId => this.attach(sessionId),
+            }
+          : undefined
+      }
+      async create(path) {
+        return {
+          id: 'ws-2',
+          path,
+          title: 'Other',
+          attachSession: sessionId => this.attach(sessionId),
+        }
+      }
+    }
+    // The session persistence layer: where the cwd of a dead (no longer live)
+    // session still lives, which is what the workspace-membership backfill
+    // must consult to re-file historical sessions.
+    class SessionPersistence extends Service {
+      constructor(context) {
+        super(context, 'sessionPersistence')
+      }
+      async list() {
+        return [
+          { id: 'session-view', cwd: '/repo' },
+          { id: 'cold-nocwd', cwd: undefined },
+        ]
+      }
     }
     ctx.plugin(Sessions)
     ctx.plugin(Workspaces)
+    ctx.plugin(SessionPersistence)
+  }
+  if (options.withCommands === true) {
+    // The slash-command registry: enough for `/task` to register and be
+    // invoked the way the UI adapter would (an agent + raw input).
+    class Commands extends Service {
+      constructor(context) {
+        super(context, 'commands')
+      }
+      registered = []
+      register(definition) {
+        this.registered.push(definition)
+      }
+    }
+    ctx.plugin(Commands)
   }
   ctx.plugin(Taskboard)
   await ctx.start?.()
   // Service.init is async; wait until the table handles are bound.
-  for (let i = 0; i < 100 && ctx.taskboard === undefined; i += 1) await new Promise(r => setImmediate(r))
+  for (let i = 0; i < 100 && ctx.taskboard === undefined; i += 1)
+    await new Promise(r => setImmediate(r))
   assert.ok(ctx.taskboard, 'taskboard service did not register')
   await new Promise(r => setImmediate(r))
   return { board: ctx.taskboard, ctx }
@@ -145,6 +238,44 @@ test('an agent cannot declare its own work accepted', () => {
   assert.equal(canTransition('in_progress', 'in_review', 'agent'), true)
 })
 
+test('archiving is a human act, like accepting', () => {
+  // The third fence: shelving finished work as archieved is the human's call.
+  assert.equal(canTransition('done', 'archieved', 'agent'), false)
+  assert.equal(canTransition('done', 'archieved', 'user'), true)
+  assert.equal(canTransition('in_review', 'archieved', 'agent'), false)
+  assert.equal(canTransition('failed', 'archieved', 'user'), true)
+  // Leaving the shelf stays permissive, like leaving done, so a human (or the
+  // board's own flows) can restore shelved work without a second fence.
+  assert.equal(canTransition('archieved', 'backlog', 'user'), true)
+  assert.equal(canTransition('archieved', 'todo', 'agent'), true)
+})
+
+test('archieved is a recognized board status', () => {
+  assert.equal(isTaskStatus('archieved'), true)
+  assert.equal(isTaskStatus('nonsense'), false)
+})
+
+test('an agent cannot archive an issue at the service boundary', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask(
+    { projectId: 'p1', title: 'Accepted work', status: 'done' },
+    human,
+  )
+
+  await assert.rejects(
+    () => board.updateTask(task.id, { status: 'archieved' }, { actor: robot }),
+    err => err instanceof TaskboardError && err.code === 'forbidden-transition',
+  )
+  assert.equal(board.getTask(task.id).status, 'done')
+
+  const archived = await board.updateTask(task.id, { status: 'archieved' }, { actor: human })
+  assert.equal(archived.status, 'archieved')
+  // Restoring shelves back to the flow is a plain permitted move.
+  const restored = await board.updateTask(task.id, { status: 'backlog' }, { actor: human })
+  assert.equal(restored.status, 'backlog')
+})
+
 test('nothing moves back into the approval queue', () => {
   for (const from of ['backlog', 'todo', 'in_progress', 'done']) {
     assert.equal(canTransition(from, 'proposed', 'user'), false)
@@ -158,7 +289,11 @@ test('a stale write is refused instead of overwriting', async () => {
   const task = await board.createTask({ projectId: 'p1', title: 'First' }, human)
   assert.equal(task.version, 0)
 
-  const updated = await board.updateTask(task.id, { title: 'Renamed' }, { actor: human, expectedVersion: 0 })
+  const updated = await board.updateTask(
+    task.id,
+    { title: 'Renamed' },
+    { actor: human, expectedVersion: 0 },
+  )
   assert.equal(updated.version, 1)
   assert.equal(updated.title, 'Renamed')
 
@@ -217,6 +352,59 @@ test('approving records who did it', async () => {
   assert.equal(board.listActivity(proposal.id)[1].actor.type, 'user')
 })
 
+// ── delete ────────────────────────────────────────────────────────────────────
+
+test('deleting an issue removes it and everything that referenced it', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Doomed' }, human)
+  await board.addComment(task.id, 'a note', human)
+  await board.record(task.id, 'custom', human)
+  // A neighbour's rows must survive: only rows that referenced the issue die.
+  const neighbour = await board.createTask({ projectId: 'p1', title: 'Neighbour' }, human)
+  await board.addComment(neighbour.id, 'keep me', human)
+
+  const deleted = await board.deleteTask(task.id, { actor: human })
+  assert.equal(deleted, true)
+
+  assert.equal(board.getTask(task.id), undefined)
+  assert.equal(
+    board.listTasks().some(item => item.id === task.id),
+    false,
+  )
+  assert.deepEqual(board.listComments(task.id), [])
+  assert.deepEqual(board.listActivity(task.id), [])
+  // The neighbour and its comment are untouched.
+  assert.equal(board.getTask(neighbour.id).title, 'Neighbour')
+  assert.equal(board.listComments(neighbour.id).length, 1)
+})
+
+test('an agent cannot delete an issue', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Protected' }, human)
+
+  // Erasing an issue is a human act, the same fence as acceptance: the agent
+  // is refused at the service boundary, not at some caller's discretion.
+  await assert.rejects(
+    () => board.deleteTask(task.id, { actor: robot }),
+    err => err instanceof TaskboardError && err.code === 'forbidden',
+  )
+  assert.equal(board.getTask(task.id).title, 'Protected')
+})
+
+test('deleting a missing issue is a no-op, not an error', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Gone soon' }, human)
+  await board.deleteTask(task.id, { actor: human })
+
+  // "Already gone" is the desired end state — a double-click or a second tab
+  // deleting the same issue answers false instead of raising.
+  const again = await board.deleteTask(task.id, { actor: human })
+  assert.equal(again, false)
+})
+
 /**
  * Run a body from a fiber that injected ONLY `taskboard`, the way the RPC route
  * actually calls in. Cordis refuses `ctx.<service>` for anything the calling
@@ -230,7 +418,9 @@ function fromRestrictedFiber(ctx, body) {
   return new Promise((resolve, reject) => {
     ctx.plugin({
       inject: ['taskboard'],
-      apply: child => { Promise.resolve(body(child)).then(resolve, reject) },
+      apply: child => {
+        Promise.resolve(body(child)).then(resolve, reject)
+      },
     })
   })
 }
@@ -317,6 +507,89 @@ test('a task whose session died is rebound to a fresh session', async () => {
   assert.equal(ctx.agents.entries.length, 1)
 })
 
+test('an issue in a project without a workspace path still gets a session cwd', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  // The fallback default board is created without a workspacePath; a project a
+  // human created by hand may have one, too. A spawned session must still carry
+  // a cwd — a no-cwd session lands in "ungrouped" and prompt assembly fails on
+  // the `{{cwd}}` variable.
+  await board.createProject({ id: 'p1', name: 'Tasks' })
+  const first = await board.createTask({ projectId: 'p1', title: 'First' }, human)
+  const second = await board.createTask({ projectId: 'p1', title: 'Second' }, human)
+
+  // With no caller cwd to borrow, the harness process's cwd is the last resort.
+  const started = await fromRestrictedFiber(ctx, child => startTask(child, board, first.id))
+  assert.equal(started.status, 'in_progress')
+  assert.equal(ctx.agents.entries[0].options.meta.cwd, process.cwd())
+
+  // A caller (the board's RPC route, for example) can lend the viewing
+  // session's cwd, which is a better fallback than the process cwd.
+  const rerun = await fromRestrictedFiber(ctx, child =>
+    startTask(child, board, second.id, { cwd: '/viewer-repo' }),
+  )
+  assert.equal(rerun.status, 'in_progress')
+  assert.equal(ctx.agents.entries.length, 2)
+  assert.equal(ctx.agents.entries[1].options.meta.cwd, '/viewer-repo')
+})
+
+test('a spawned issue session attaches to the workspace owning its cwd', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  await board.createProject({ id: 'p1', name: 'Repo Board', workspacePath: '/repo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Attach me' }, human)
+
+  const started = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id))
+
+  // The sidebar groups by workspace MEMBERSHIP (attachSession), not by cwd —
+  // without the attach the fresh session would sit in the "ungrouped" bucket.
+  assert.equal(started.status, 'in_progress')
+  assert.deepEqual(ctx.workspaceRegistry.attached, [started.sessionId])
+
+  // A cwd no workspace owns yet is covered too: the registry creates the
+  // workspace, so the session still lands under a folder instead of ungrouped.
+  await board.createProject({ id: 'p2', name: 'New Repo Board', workspacePath: '/fresh-repo' })
+  const fresh = await board.createTask({ projectId: 'p2', title: 'Attach fresh' }, human)
+  const second = await fromRestrictedFiber(ctx, child => startTask(child, board, fresh.id))
+  assert.equal(second.status, 'in_progress')
+  assert.deepEqual(ctx.workspaceRegistry.attached, [started.sessionId, second.sessionId])
+})
+
+test('mount-time reconciliation re-files issue sessions left ungrouped', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  await board.createProject({ id: 'p1', name: 'Repo Board', workspacePath: '/repo' })
+  // A historical session: bound to an issue but never attached to a workspace —
+  // the state sessions spawned before the attach fix were left in.
+  const historic = await board.createTask({ projectId: 'p1', title: 'Historic' }, human)
+  await board.openExecution(historic.id, 'old-session', { actor: human, status: 'in_progress' })
+
+  await fromRestrictedFiber(ctx, child => reconcileWorkspaceMembership(child, board))
+
+  assert.deepEqual(ctx.workspaceRegistry.attached, ['old-session'])
+})
+
+test('reconciliation reaches cold default-board sessions through persistence', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  // The fallback board has no workspace path; the session's own cwd — known
+  // only to the persistence layer for a dead session — decides the workspace.
+  await board.createProject({ id: 'default', name: 'Tasks' })
+  const historic = await board.createTask({ projectId: 'default', title: 'Historic' }, human)
+  await board.openExecution(historic.id, 'session-view', { actor: human, status: 'in_progress' })
+
+  await fromRestrictedFiber(ctx, child => reconcileWorkspaceMembership(child, board))
+
+  assert.deepEqual(ctx.workspaceRegistry.attached, ['session-view'])
+})
+
+test('reconciliation leaves sessions without a cwd alone', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  await board.createProject({ id: 'default', name: 'Tasks' })
+  const historic = await board.createTask({ projectId: 'default', title: 'Historic' }, human)
+  await board.openExecution(historic.id, 'cold-nocwd', { actor: human, status: 'in_progress' })
+
+  await fromRestrictedFiber(ctx, child => reconcileWorkspaceMembership(child, board))
+
+  assert.deepEqual(ctx.workspaceRegistry.attached, [])
+})
+
 test('the board picks the next issue itself, highest priority first', async () => {
   const { board, ctx } = await boardFixture({ withAgents: true })
   await board.createProject({ id: 'p1', name: 'Demo' })
@@ -352,7 +625,9 @@ test('a session sees the board of the workspace its cwd belongs to', async () =>
 
   // The main conversation's cwd comes from the SESSION STORE; the board must
   // bind to the workspace that path resolves to, not to the caller.
-  const project = await fromRestrictedFiber(ctx, child => resolveProject(child, board, 'session-view'))
+  const project = await fromRestrictedFiber(ctx, child =>
+    resolveProject(child, board, 'session-view'),
+  )
 
   assert.equal(project.name, 'Sample Repo')
   assert.equal(project.workspacePath, '/repo')
@@ -479,7 +754,10 @@ test('a dead session frees its slot for the next issue', async () => {
 test('a re-run forces a fresh session even when a live one is idle-bound', async () => {
   const { board, ctx } = await boardFixture({ withAgents: true })
   await board.createProject({ id: 'p1', name: 'Demo' })
-  const task = await board.createTask({ projectId: 'p1', title: 'Do it again', status: 'todo' }, human)
+  const task = await board.createTask(
+    { projectId: 'p1', title: 'Do it again', status: 'todo' },
+    human,
+  )
 
   // First run binds a session; the agent stays live (idle after its turn).
   const first = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id))
@@ -490,7 +768,9 @@ test('a re-run forces a fresh session even when a live one is idle-bound', async
   assert.equal(guarded.sessionId, first.sessionId)
 
   // A forced re-run opens a NEW session and a NEW execution record.
-  const reran = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id, { force: true }))
+  const reran = await fromRestrictedFiber(ctx, child =>
+    startTask(child, board, task.id, { force: true }),
+  )
   assert.notEqual(reran.sessionId, first.sessionId)
   assert.equal(ctx.agents.entries.length, 2)
   assert.equal(reran.executions.length, 2)
@@ -499,9 +779,15 @@ test('a re-run forces a fresh session even when a live one is idle-bound', async
 test('settling an execution records the outcome and can land failed', async () => {
   const { board } = await boardFixture()
   await board.createProject({ id: 'p1', name: 'Demo' })
-  const task = await board.createTask({ projectId: 'p1', title: 'Do the thing', status: 'todo' }, human)
+  const task = await board.createTask(
+    { projectId: 'p1', title: 'Do the thing', status: 'todo' },
+    human,
+  )
 
-  const opened = await board.openExecution(task.id, 'sess-1', { actor: human, status: 'in_progress' })
+  const opened = await board.openExecution(task.id, 'sess-1', {
+    actor: human,
+    status: 'in_progress',
+  })
   assert.equal(opened.executions.length, 1)
   assert.equal(opened.executions[0].result, undefined)
 
@@ -531,7 +817,11 @@ test('settling a settled execution is a no-op', async () => {
   await board.openExecution(task.id, 'sess-1', { actor: human, status: 'in_progress' })
   const done = await board.settleExecution(task.id, 'succeeded', { actor: human })
   const again = await board.settleExecution(task.id, 'failed', { actor: human })
-  assert.equal(again.executions[0].result, 'succeeded', 'a late settle cannot flip a settled result')
+  assert.equal(
+    again.executions[0].result,
+    'succeeded',
+    'a late settle cannot flip a settled result',
+  )
   assert.equal(done.version, again.version, 'a no-op settle does not bump the version')
 })
 
@@ -543,14 +833,24 @@ test('enabling a schedule computes the next run; disabling clears it', async () 
   const task = await board.createTask({ projectId: 'p1', title: 'Daily' }, human)
   const from = Date.parse('2026-01-01T00:00:00.000Z')
 
-  const armed = await board.updateScheduleRule(task.id, { enabled: true, cron: '0 9 * * *' }, { actor: human }, from)
+  const armed = await board.updateScheduleRule(
+    task.id,
+    { enabled: true, cron: '0 9 * * *' },
+    { actor: human },
+    from,
+  )
   assert.equal(armed.schedule.enabled, true)
   assert.equal(armed.schedule.cron, '0 9 * * *')
   assert.equal(armed.schedule.nextRunAt, nextRunAtMs('0 9 * * *', from))
   assert.equal(armed.schedule.lastTriggeredAt, undefined)
 
   // Disabling clears the due instant so a stale one can never linger.
-  const disarmed = await board.updateScheduleRule(task.id, { enabled: false }, { actor: human }, from)
+  const disarmed = await board.updateScheduleRule(
+    task.id,
+    { enabled: false },
+    { actor: human },
+    from,
+  )
   assert.equal(disarmed.schedule.enabled, false)
   assert.equal(disarmed.schedule.nextRunAt, undefined)
 })
@@ -561,21 +861,34 @@ test('an invalid schedule expression is refused', async () => {
   const task = await board.createTask({ projectId: 'p1', title: 'Daily' }, human)
 
   await assert.rejects(
-    () => board.updateScheduleRule(task.id, { enabled: true, cron: 'not a cron' }, { actor: human }),
+    () =>
+      board.updateScheduleRule(task.id, { enabled: true, cron: 'not a cron' }, { actor: human }),
     err => err instanceof TaskboardError && err.code === 'invalid-input',
   )
-  assert.equal(board.getTask(task.id).schedule, undefined, 'a rejected rule leaves the task untouched')
+  assert.equal(
+    board.getTask(task.id).schedule,
+    undefined,
+    'a rejected rule leaves the task untouched',
+  )
 })
 
 test('the scheduler runs a due issue for real and rolls the rule forward', async () => {
   const { board, ctx } = await boardFixture({ withAgents: true })
   await board.createProject({ id: 'p1', name: 'Demo' })
-  const task = await board.createTask({ projectId: 'p1', title: 'Scheduled', status: 'todo' }, human)
+  const task = await board.createTask(
+    { projectId: 'p1', title: 'Scheduled', status: 'todo' },
+    human,
+  )
 
   // Arm with a minute-aligned rule and force nextRunAt into the past.
   const now = Date.now()
   const due = nextRunAtMs('* * * * *', now - 60_000)
-  await board.updateScheduleRule(task.id, { enabled: true, cron: '* * * * *' }, { actor: human }, now)
+  await board.updateScheduleRule(
+    task.id,
+    { enabled: true, cron: '* * * * *' },
+    { actor: human },
+    now,
+  )
   await board.rollSchedule(task.id, due, now - 60_000)
 
   const scheduler = schedulerFixture(ctx, { autoPull: false })
@@ -597,7 +910,12 @@ test('an issue already executing at its due instant skips the run', async () => 
   // Arm "every minute" from two minutes ago, so the computed next run is
   // already in the past when the tick reads the wall clock — deterministically
   // due, without touching lastTriggeredAt.
-  await board.updateScheduleRule(task.id, { enabled: true, cron: '* * * * *' }, { actor: human }, Date.now() - 120_000)
+  await board.updateScheduleRule(
+    task.id,
+    { enabled: true, cron: '* * * * *' },
+    { actor: human },
+    Date.now() - 120_000,
+  )
   const busy = board.getTask(task.id)
   assert.ok(busy.schedule.nextRunAt < Date.now(), 'the rule is staged due')
 
@@ -605,8 +923,15 @@ test('an issue already executing at its due instant skips the run', async () => 
   await scheduler.tick()
 
   const stored = board.getTask(task.id)
-  assert.equal(stored.executions.length, 1, 'no second execution while the issue is already running')
-  assert.ok(stored.schedule.nextRunAt > Date.now() - 120_000, 'the rule rolled forward, skipping this occurrence')
+  assert.equal(
+    stored.executions.length,
+    1,
+    'no second execution while the issue is already running',
+  )
+  assert.ok(
+    stored.schedule.nextRunAt > Date.now() - 120_000,
+    'the rule rolled forward, skipping this occurrence',
+  )
   assert.equal(stored.schedule.lastTriggeredAt, undefined, 'a skipped run never records a trigger')
 })
 
@@ -629,11 +954,162 @@ test('reconciliation leaves a live session and plan-claimed issues alone', async
   await board.createProject({ id: 'p1', name: 'Demo' })
   const live = await board.createTask({ projectId: 'p1', title: 'Live', status: 'todo' }, human)
   await fromRestrictedFiber(ctx, child => startTask(child, board, live.id))
-  const claimed = await board.createTask({ projectId: 'p1', title: 'Claimed', status: 'in_progress' }, human)
+  const claimed = await board.createTask(
+    { projectId: 'p1', title: 'Claimed', status: 'in_progress' },
+    human,
+  )
 
   await reconcileOrphans(ctx, board)
 
   assert.equal(board.getTask(live.id).status, 'in_progress', 'a live session stays in progress')
-  assert.equal(board.getTask(claimed.id).status, 'in_progress', 'a session-less claim is not an orphan')
+  assert.equal(
+    board.getTask(claimed.id).status,
+    'in_progress',
+    'a session-less claim is not an orphan',
+  )
   assert.equal(board.getTask(claimed.id).executions.length, 0)
+})
+
+// ── /task command scoping ─────────────────────────────────────────────────────
+
+test('/task lands the issue on the board the invoking session sees', async () => {
+  const { board, ctx } = await boardFixture({ withSessions: true, withCommands: true })
+  await new Promise((resolve, reject) => {
+    ctx.plugin({
+      inject: ['commands', 'taskboard'],
+      apply: child => {
+        Promise.resolve(applyCommand(child)).then(resolve, reject)
+      },
+    })
+  })
+  const command = ctx.commands.registered[0]
+  assert.ok(command, 'the /task command did not register')
+
+  // The UI adapter hands the exact agent whose session received the command.
+  const outcome = await command.handler({
+    rawInput: 'Do the thing',
+    agent: { id: 'session-view' },
+  })
+
+  // The issue must live on the board this session's tab resolves to — the
+  // workspace board — NOT on a hidden fallback board. That is the whole fix:
+  // creation and display resolve the same way, so a task is never invisible.
+  const project = await resolveProject(ctx, board, 'session-view')
+  const task = board.listTasks()[0]
+  assert.equal(task.projectId, project.id, "the issue must land on the session's own board")
+  assert.equal(task.title, 'Do the thing')
+  assert.equal(task.status, 'todo')
+  assert.match(outcome.text, /Do the thing/)
+})
+
+test('/task from a session without a cwd falls back to the default board, like its tab', async () => {
+  const { board, ctx } = await boardFixture({ withSessions: true, withCommands: true })
+  await new Promise((resolve, reject) => {
+    ctx.plugin({
+      inject: ['commands', 'taskboard'],
+      apply: child => {
+        Promise.resolve(applyCommand(child)).then(resolve, reject)
+      },
+    })
+  })
+  const command = ctx.commands.registered[0]
+
+  await command.handler({ rawInput: 'Ungrouped idea', agent: { id: 'no-such-session' } })
+
+  const task = board.listTasks()[0]
+  assert.equal(task.projectId, 'default', 'a no-cwd session keeps the default board')
+  assert.equal(task.title, 'Ungrouped idea')
+})
+
+// ── cross-board move ─────────────────────────────────────────────────────────
+
+test('task.update moves an issue to another project, keeping everything else', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'First' })
+  await board.createProject({ id: 'p2', name: 'Second' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Wanderer', status: 'todo' }, human)
+  const before = board.listComments(task.id).length
+
+  // The move is one projectId patch: the issue keeps its id, status, version
+  // chain, and bound session — only where it lives changes.
+  const moved = await board.updateTask(
+    task.id,
+    { projectId: 'p2' },
+    { actor: human, expectedVersion: task.version },
+  )
+  assert.equal(moved.projectId, 'p2')
+  assert.equal(moved.status, 'todo')
+  assert.equal(moved.version, task.version + 1)
+  assert.equal(board.getTask(task.id).projectId, 'p2')
+  assert.equal(board.listTasks({ projectId: 'p1' }).length, 0)
+  assert.equal(board.listTasks({ projectId: 'p2' }).length, 1)
+
+  // The audit trail records the move with both ends.
+  const kinds = board.listActivity(task.id).map(row => row.kind)
+  assert.deepEqual(kinds, ['created', 'moved'])
+  assert.deepEqual(board.listActivity(task.id)[1].detail, { from: 'p1', to: 'p2' })
+
+  // Nothing else on the issue was disturbed.
+  assert.equal(board.listComments(task.id).length, before)
+})
+
+test('a move into a project that does not exist is refused', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'First' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Stuck here' }, human)
+
+  await assert.rejects(
+    () => board.updateTask(task.id, { projectId: 'ghost-board' }, { actor: human }),
+    err => err instanceof TaskboardError && err.code === 'not-found',
+  )
+  assert.equal(board.getTask(task.id).projectId, 'p1', 'a refused move leaves the issue in place')
+})
+
+test('clearing projectId is dropped — the required field is not patch-clearable', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'First' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Anchored' }, human)
+
+  const kept = await board.updateTask(task.id, { projectId: null }, { actor: human })
+  assert.equal(kept.projectId, 'p1', 'null projectId must never reach storage')
+})
+
+test('board ownership reconcile moves fallback-board issues to their workspace board', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  // The legacy state: an issue on the fallback "Tasks" board, worked by a
+  // session whose cwd belongs to a real workspace.
+  await board.createProject({ id: 'default', name: 'Tasks' })
+  const legacy = await board.createTask({ projectId: 'default', title: 'Legacy' }, human)
+  await board.openExecution(legacy.id, 'session-view', { actor: human, status: 'in_progress' })
+
+  await fromRestrictedFiber(ctx, child => reconcileBoardOwnership(child, board))
+
+  const moved = board.getTask(legacy.id)
+  assert.notEqual(moved.projectId, 'default', 'the issue left the fallback board')
+  const target = board.getProject(moved.projectId)
+  assert.equal(target.workspaceId, 'ws-1', 'it landed on the workspace board of its session')
+  assert.equal(target.name, 'Sample Repo')
+  assert.equal(moved.status, 'in_progress', 'the move disturbs nothing but the board')
+  assert.equal(moved.sessionId, 'session-view')
+
+  // Idempotent: a second sweep finds nothing left to do and mints nothing.
+  const projectsAfterFirst = board.listProjects().length
+  await fromRestrictedFiber(ctx, child => reconcileBoardOwnership(child, board))
+  assert.equal(board.getTask(legacy.id).projectId, moved.projectId)
+  assert.equal(board.listProjects().length, projectsAfterFirst)
+})
+
+test('board ownership reconcile leaves unresolvable issues on the fallback board', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true, withSessions: true })
+  await board.createProject({ id: 'default', name: 'Tasks' })
+  // A session with no cwd, and a session-less issue: neither can name a
+  // workspace, so both stay where they are.
+  const cold = await board.createTask({ projectId: 'default', title: 'Cold' }, human)
+  await board.openExecution(cold.id, 'cold-nocwd', { actor: human, status: 'in_progress' })
+  const unbound = await board.createTask({ projectId: 'default', title: 'Unbound' }, human)
+
+  await fromRestrictedFiber(ctx, child => reconcileBoardOwnership(child, board))
+
+  assert.equal(board.getTask(cold.id).projectId, 'default')
+  assert.equal(board.getTask(unbound.id).projectId, 'default')
 })

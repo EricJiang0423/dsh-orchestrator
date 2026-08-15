@@ -36,6 +36,10 @@ how you verified it.
 finishing work and accepting work are two different acts, and the second one is
 the human's. Wait for them to accept it, or to tell you what still needs doing.
 
+**Do not move an issue to `archieved` either.** Archiving is shelving finished
+work, and shelving is as much the human's call as accepting is. Leave `archieved`
+alone; the human archives accepted work from the board.
+
 ## Proposing new work
 
 When you find work worth doing that is not this issue, do not start it and do not

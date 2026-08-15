@@ -40,13 +40,17 @@ export function applySkill(ctx: Context): void {
     return
   }
 
-  ctx.effect(() => ctx.skills.register({
-    name: 'manage-taskboard',
-    description:
-      'How to work an issue on the task board — claim it, report progress, and hand it back. '
-      + 'Use whenever you pick up, update, or finish a board issue, or want to propose new work.',
-    // `bundled`: it ships inside this plugin rather than being discovered on disk.
-    source: 'bundled',
-    content,
-  }), 'taskboard: skill')
+  ctx.effect(
+    () =>
+      ctx.skills.register({
+        name: 'manage-taskboard',
+        description:
+          'How to work an issue on the task board — claim it, report progress, and hand it back. ' +
+          'Use whenever you pick up, update, or finish a board issue, or want to propose new work.',
+        // `bundled`: it ships inside this plugin rather than being discovered on disk.
+        source: 'bundled',
+        content,
+      }),
+    'taskboard: skill',
+  )
 }

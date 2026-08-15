@@ -13,7 +13,7 @@
  * parsing.
  * @module dsh-orchestrator/wire
  */
-import type { Activity, Comment, Project, Task } from './domain.ts'
+import type { Activity, Comment, Project, SessionMessage, Task } from './domain.ts'
 import type { CreateTaskInput, TaskFilter, TaskboardErrorCode, UpdateTaskPatch } from './service.ts'
 
 export type { ExecutionRecord, ExecutionResult, ScheduleRule } from './domain.ts'
@@ -58,6 +58,8 @@ export interface TaskDetail {
   task: Task
   comments: Comment[]
   activity: Activity[]
+  /** Inter-session agent messages involving this issue. */
+  messages: SessionMessage[]
 }
 
 /**
@@ -71,12 +73,17 @@ export interface BoardView {
   project: Project
   tasks: Task[]
   scheduler: SchedulerState
+  /** Inter-session agent messages on this board, for card badges. */
+  messages: SessionMessage[]
 }
 
 /** Params and result of every callable method, keyed by method name. */
 export interface TaskboardApi {
   'project.list': { params: Record<never, never>; result: Project[] }
-  'project.create': { params: { id?: string; name: string; workspacePath?: string }; result: Project }
+  'project.create': {
+    params: { id?: string; name: string; workspacePath?: string }
+    result: Project
+  }
   'task.list': { params: TaskFilter; result: Task[] }
   'task.get': { params: { id: string }; result: TaskDetail | null }
   'task.create': { params: CreateTaskInput; result: Task }
@@ -86,21 +93,42 @@ export interface TaskboardApi {
   }
   'comment.create': { params: { taskId: string; body: string }; result: Comment }
   /** Open a fresh session for one issue and hand it the work. */
-  'task.start': { params: { id: string }; result: Task }
+  'task.start': { params: { id: string; sessionId?: string }; result: Task }
   /** Re-run a settled/finished issue in a FRESH session (the live-session guard does not block it). */
-  'task.rerun': { params: { id: string }; result: Task }
+  'task.rerun': { params: { id: string; sessionId?: string }; result: Task }
   /** Arm/disarm or change an issue's cron schedule. */
-  'task.schedule': { params: { id: string; patch: SchedulePatch; expectedVersion?: number }; result: Task }
+  'task.schedule': {
+    params: { id: string; patch: SchedulePatch; expectedVersion?: number }
+    result: Task
+  }
   /** Start the next todo issue — the board picks it. */
-  'task.startNext': { params: { projectId?: string }; result: Task | null }
+  'task.startNext': { params: { projectId?: string; sessionId?: string }; result: Task | null }
   /** The board this session belongs to, with live scheduler state. */
   'board.view': { params: { sessionId: string }; result: BoardView }
   /** Accept finished work (in_review to done) — the second human fence. */
   'task.accept': { params: { id: string; expectedVersion?: number }; result: Task }
   /** Send finished work back for more (in_review to todo), with a reason. */
-  'task.sendBack': { params: { id: string; reason: string; expectedVersion?: number }; result: Task }
+  'task.sendBack': {
+    params: { id: string; reason: string; expectedVersion?: number }
+    result: Task
+  }
+  /**
+   * Delete an issue permanently.
+   *
+   * `true` when the issue existed and was removed; `false` when it was already
+   * gone (deleting an absent issue is the desired end state, not an error).
+   * Like acceptance, this is a human act: the service refuses any agent actor.
+   */
+  'task.delete': { params: { id: string }; result: boolean }
   /** Change how many issues run at once, and whether the board refills itself. */
   'scheduler.configure': { params: SchedulerConfig; result: SchedulerState }
+  /** Inter-session agent messages on one board (the browser only reads them; agents send via the tool). */
+  'message.list': { params: { projectId: string }; result: SessionMessage[] }
+  /** Post session mail as the human at the keyboard; the agent path is the tool. */
+  'message.post': {
+    params: { sessionId: string; toIssueId?: string; toSessionId?: string; body: string }
+    result: SessionMessage
+  }
 }
 
 /** Callable method names. */
@@ -126,7 +154,10 @@ export const TASKBOARD_METHODS = [
   'board.view',
   'task.accept',
   'task.sendBack',
+  'task.delete',
   'scheduler.configure',
+  'message.list',
+  'message.post',
 ] as const satisfies readonly TaskboardMethod[]
 
 /** What the host answers. Failures carry the service's own code. */

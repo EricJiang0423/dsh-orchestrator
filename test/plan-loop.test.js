@@ -17,22 +17,31 @@ function fakeTable() {
   let chain = Promise.resolve()
   const enqueue = fn => {
     const next = chain.then(fn, fn)
-    chain = next.then(() => {}, () => {})
+    chain = next.then(
+      () => {},
+      () => {},
+    )
     return next
   }
   return {
     get: key => records.get(key),
     entries: () => [...records.entries()][Symbol.iterator](),
     keys: () => [...records.keys()][Symbol.iterator](),
-    get size() { return records.size },
-    put: (key, value) => enqueue(() => { records.set(key, value) }),
+    get size() {
+      return records.size
+    },
+    put: (key, value) =>
+      enqueue(() => {
+        records.set(key, value)
+      }),
     delete: key => enqueue(() => records.delete(key)),
-    update: (key, fn) => enqueue(() => {
-      if (!records.has(key)) throw new Error('missing-key')
-      const next = fn(records.get(key))
-      records.set(key, next)
-      return next
-    }),
+    update: (key, fn) =>
+      enqueue(() => {
+        if (!records.has(key)) throw new Error('missing-key')
+        const next = fn(records.get(key))
+        records.set(key, next)
+        return next
+      }),
   }
 }
 
@@ -56,7 +65,12 @@ async function planFixture(runValue) {
   })
 
   const registered = []
-  ctx.reflect.provide('tools', { register: definition => { registered.push(definition); return () => {} } })
+  ctx.reflect.provide('tools', {
+    register: definition => {
+      registered.push(definition)
+      return () => {}
+    },
+  })
   ctx.reflect.provide('subagents', {
     getProvider: () => ({ capabilities: { outputSchema: true }, inheritsParentContext: false }),
   })
@@ -74,7 +88,8 @@ async function planFixture(runValue) {
   })
 
   ctx.plugin(Taskboard)
-  for (let i = 0; i < 100 && ctx.taskboard === undefined; i += 1) await new Promise(r => setImmediate(r))
+  for (let i = 0; i < 100 && ctx.taskboard === undefined; i += 1)
+    await new Promise(r => setImmediate(r))
   await new Promise(r => setImmediate(r))
   applyPlanLoop(ctx)
 
@@ -89,7 +104,10 @@ const exec = { agent: { id: 'parent-session' }, signal: new AbortController().si
 test('only todo issues are admitted — the approval queue is not a work queue', async () => {
   const { board, tool, starts } = await planFixture({ rounds: [], roundsStarted: 0, remaining: [] })
   await board.createProject({ id: 'p1', name: 'Demo' })
-  const todo = await board.createTask({ projectId: 'p1', title: 'Real work', status: 'todo' }, human)
+  const todo = await board.createTask(
+    { projectId: 'p1', title: 'Real work', status: 'todo' },
+    human,
+  )
   await board.createTask({ projectId: 'p1', title: 'Agent idea', status: 'proposed' }, human)
   await board.createTask({ projectId: 'p1', title: 'Someday', status: 'backlog' }, human)
 
@@ -114,7 +132,10 @@ test('a caller cannot raise the round cap past the deployment ceiling', async ()
 test('claimed issues move to in_progress before any worker starts', async () => {
   const { board, tool } = await planFixture({ rounds: [], roundsStarted: 0, remaining: [] })
   await board.createProject({ id: 'p1', name: 'Demo' })
-  const task = await board.createTask({ projectId: 'p1', title: 'Real work', status: 'todo' }, human)
+  const task = await board.createTask(
+    { projectId: 'p1', title: 'Real work', status: 'todo' },
+    human,
+  )
 
   await tool.execute({}, exec)
 
@@ -144,28 +165,72 @@ test('the report decides the status, host-side', async () => {
   const robot = { type: 'agent', id: 'a1', name: 'planner' }
 
   const done = await board.createTask({ projectId: 'p1', title: 'A', status: 'in_progress' }, human)
-  await applyRound(ctx, {
-    issueId: done.id,
-    round: 1,
-    report: { status: 'complete', summary: 'did it', evidence: ['tests pass'], nextSteps: [], blocker: '' },
-  }, robot)
-  assert.equal(board.getTask(done.id).status, 'in_review', 'complete hands back, it does not accept')
+  await applyRound(
+    ctx,
+    {
+      issueId: done.id,
+      round: 1,
+      report: {
+        status: 'complete',
+        summary: 'did it',
+        evidence: ['tests pass'],
+        nextSteps: [],
+        blocker: '',
+      },
+    },
+    robot,
+  )
+  assert.equal(
+    board.getTask(done.id).status,
+    'in_review',
+    'complete hands back, it does not accept',
+  )
 
-  const stuck = await board.createTask({ projectId: 'p1', title: 'B', status: 'in_progress' }, human)
-  await applyRound(ctx, {
-    issueId: stuck.id,
-    round: 1,
-    report: { status: 'blocked', summary: 'stuck', evidence: [], nextSteps: [], blocker: 'needs a key' },
-  }, robot)
+  const stuck = await board.createTask(
+    { projectId: 'p1', title: 'B', status: 'in_progress' },
+    human,
+  )
+  await applyRound(
+    ctx,
+    {
+      issueId: stuck.id,
+      round: 1,
+      report: {
+        status: 'blocked',
+        summary: 'stuck',
+        evidence: [],
+        nextSteps: [],
+        blocker: 'needs a key',
+      },
+    },
+    robot,
+  )
   assert.equal(board.getTask(stuck.id).status, 'blocked')
 
-  const going = await board.createTask({ projectId: 'p1', title: 'C', status: 'in_progress' }, human)
-  await applyRound(ctx, {
-    issueId: going.id,
-    round: 1,
-    report: { status: 'continue', summary: 'partway', evidence: [], nextSteps: ['keep going'], blocker: '' },
-  }, robot)
-  assert.equal(board.getTask(going.id).status, 'in_progress', 'continue leaves the issue where it is')
+  const going = await board.createTask(
+    { projectId: 'p1', title: 'C', status: 'in_progress' },
+    human,
+  )
+  await applyRound(
+    ctx,
+    {
+      issueId: going.id,
+      round: 1,
+      report: {
+        status: 'continue',
+        summary: 'partway',
+        evidence: [],
+        nextSteps: ['keep going'],
+        blocker: '',
+      },
+    },
+    robot,
+  )
+  assert.equal(
+    board.getTask(going.id).status,
+    'in_progress',
+    'continue leaves the issue where it is',
+  )
 
   // Every round leaves a readable trail on the issue.
   assert.equal(board.listComments(done.id).length, 1)
@@ -179,16 +244,31 @@ test('an agent still cannot reach done through the loop', async () => {
   const task = await board.createTask({ projectId: 'p1', title: 'A', status: 'in_progress' }, human)
 
   // `complete` is the strongest thing a worker can say, and it stops at in_review.
-  await applyRound(ctx, {
-    issueId: task.id,
-    round: 1,
-    report: { status: 'complete', summary: 'did it', evidence: ['proof'], nextSteps: [], blocker: '' },
-  }, robot)
+  await applyRound(
+    ctx,
+    {
+      issueId: task.id,
+      round: 1,
+      report: {
+        status: 'complete',
+        summary: 'did it',
+        evidence: ['proof'],
+        nextSteps: [],
+        blocker: '',
+      },
+    },
+    robot,
+  )
   assert.notEqual(board.getTask(task.id).status, 'done')
 })
 
 test('urgent work is admitted before the rest', () => {
   const at = (priority, sortKey) => ({ priority, sortKey, id: priority })
-  const sorted = [at('none', '1'), at('urgent', '9'), at('medium', '2'), at('high', '3')].sort(byPriority)
-  assert.deepEqual(sorted.map(task => task.priority), ['urgent', 'high', 'medium', 'none'])
+  const sorted = [at('none', '1'), at('urgent', '9'), at('medium', '2'), at('high', '3')].sort(
+    byPriority,
+  )
+  assert.deepEqual(
+    sorted.map(task => task.priority),
+    ['urgent', 'high', 'medium', 'none'],
+  )
 })

@@ -124,7 +124,10 @@ function resolveConfig(config: PlanLoopConfig): ResolvedConfig {
       throw new TypeError(`taskboard_plan ${key} must be a positive safe integer`)
     }
   }
-  if (resolved.subagentProvider.trim() !== resolved.subagentProvider || resolved.subagentProvider === '') {
+  if (
+    resolved.subagentProvider.trim() !== resolved.subagentProvider ||
+    resolved.subagentProvider === ''
+  ) {
     throw new TypeError('taskboard_plan subagentProvider must be a non-empty normalized string')
   }
   return resolved
@@ -257,7 +260,11 @@ function readRunValue(value: unknown): PlanRunValue & { failedIssueId?: string }
     throw new Error('taskboard_plan workflow returned no result object')
   }
   const record = value as Partial<PlanRunValue> & { failedIssueId?: unknown }
-  if (!Array.isArray(record.rounds) || typeof record.roundsStarted !== 'number' || !Array.isArray(record.remaining)) {
+  if (
+    !Array.isArray(record.rounds) ||
+    typeof record.roundsStarted !== 'number' ||
+    !Array.isArray(record.remaining)
+  ) {
     throw new Error('taskboard_plan workflow result is malformed')
   }
   return {
@@ -277,154 +284,188 @@ export function applyPlanLoop(ctx: Context, config: PlanLoopConfig = {}): void {
   const board = ctx.taskboard
   const resolved = resolveConfig(config)
 
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'taskboard_plan',
-    description:
-      'Work through the board queue, one fresh agent per round. Takes issues that are already on the '
-      + 'board (todo first, by priority) — it cannot invent work, and workers can only PROPOSE new '
-      + 'issues for a human to approve. Each round gets a clean context and hands the next one a '
-      + 'bounded report; an issue with work left goes to the back of the queue. Returns when the '
-      + 'queue empties or the round budget runs out.',
-    parameters: {
-      projectId: { type: 'string', description: 'Only work issues in this project' },
-      maxRounds: { type: 'number', description: 'Round cap for this run, bounded by the deployment ceiling' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          runId: { type: 'string', required: true },
-          roundsStarted: { type: 'integer', required: true },
-          completed: { type: 'array', items: { type: 'string' }, required: true },
-          blocked: { type: 'array', items: { type: 'string' }, required: true },
-          stillOpen: { type: 'array', items: { type: 'string' }, required: true },
-          proposed: { type: 'integer', required: true },
-        },
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: [
-          `${value.roundsStarted} round(s).`,
-          value.completed.length > 0 ? `Ready for review: ${value.completed.length}` : '',
-          value.blocked.length > 0 ? `Blocked: ${value.blocked.length}` : '',
-          value.stillOpen.length > 0 ? `Still open: ${value.stillOpen.length}` : '',
-          value.proposed > 0 ? `${value.proposed} new issue(s) proposed — waiting for your approval.` : '',
-        ].filter(Boolean).join(' '),
-      }],
-    },
-    async execute(args, exec) {
-      const parent = exec.agent
-      if (parent === undefined) throw new Error('taskboard_plan requires a calling agent')
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: 'taskboard_plan',
+          description:
+            'Work through the board queue, one fresh agent per round. Takes issues that are already on the ' +
+            'board (todo first, by priority) — it cannot invent work, and workers can only PROPOSE new ' +
+            'issues for a human to approve. Each round gets a clean context and hands the next one a ' +
+            'bounded report; an issue with work left goes to the back of the queue. Returns when the ' +
+            'queue empties or the round budget runs out.',
+          parameters: {
+            projectId: { type: 'string', description: 'Only work issues in this project' },
+            maxRounds: {
+              type: 'number',
+              description: 'Round cap for this run, bounded by the deployment ceiling',
+            },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                runId: { type: 'string', required: true },
+                roundsStarted: { type: 'integer', required: true },
+                completed: { type: 'array', items: { type: 'string' }, required: true },
+                blocked: { type: 'array', items: { type: 'string' }, required: true },
+                stillOpen: { type: 'array', items: { type: 'string' }, required: true },
+                proposed: { type: 'integer', required: true },
+              },
+            },
+            render: (_args, value) => [
+              {
+                type: 'text',
+                text: [
+                  `${value.roundsStarted} round(s).`,
+                  value.completed.length > 0 ? `Ready for review: ${value.completed.length}` : '',
+                  value.blocked.length > 0 ? `Blocked: ${value.blocked.length}` : '',
+                  value.stillOpen.length > 0 ? `Still open: ${value.stillOpen.length}` : '',
+                  value.proposed > 0
+                    ? `${value.proposed} new issue(s) proposed — waiting for your approval.`
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join(' '),
+              },
+            ],
+          },
+          async execute(args, exec) {
+            const parent = exec.agent
+            if (parent === undefined) throw new Error('taskboard_plan requires a calling agent')
 
-      const provider = ctx.subagents.getProvider(resolved.subagentProvider)
-      if (provider === undefined) {
-        throw new Error(`taskboard_plan subagent provider "${resolved.subagentProvider}" is not registered`)
-      }
-      if (!provider.capabilities.outputSchema) {
-        throw new Error(`taskboard_plan subagent provider "${resolved.subagentProvider}" has no structured output`)
-      }
-      if (provider.inheritsParentContext) {
-        throw new Error(`taskboard_plan subagent provider "${resolved.subagentProvider}" inherits parent context; a fresh provider is required`)
-      }
+            const provider = ctx.subagents.getProvider(resolved.subagentProvider)
+            if (provider === undefined) {
+              throw new Error(
+                `taskboard_plan subagent provider "${resolved.subagentProvider}" is not registered`,
+              )
+            }
+            if (!provider.capabilities.outputSchema) {
+              throw new Error(
+                `taskboard_plan subagent provider "${resolved.subagentProvider}" has no structured output`,
+              )
+            }
+            if (provider.inheritsParentContext) {
+              throw new Error(
+                `taskboard_plan subagent provider "${resolved.subagentProvider}" inherits parent context; a fresh provider is required`,
+              )
+            }
 
-      // A caller may lower the cap but never raise it past deployment config.
-      const requested = args.maxRounds ?? resolved.maxRounds
-      if (!Number.isSafeInteger(requested) || requested < 1) {
-        throw new Error('taskboard_plan maxRounds must be a positive safe integer')
-      }
-      const maxRounds = Math.min(requested, resolved.maxRounds)
+            // A caller may lower the cap but never raise it past deployment config.
+            const requested = args.maxRounds ?? resolved.maxRounds
+            if (!Number.isSafeInteger(requested) || requested < 1) {
+              throw new Error('taskboard_plan maxRounds must be a positive safe integer')
+            }
+            const maxRounds = Math.min(requested, resolved.maxRounds)
 
-      // Only `todo` is admitted. `proposed` is not work yet, and `backlog` is
-      // not scheduled — a loop that reached into either would be doing exactly
-      // what the approval queue exists to prevent.
-      const candidates = board
-        .listTasks({ ...(args.projectId !== undefined ? { projectId: args.projectId } : {}), status: 'todo' })
-        .sort(byPriority)
-        .slice(0, resolved.maxIssues)
-      if (candidates.length === 0) {
-        return {
-          runId: '',
-          roundsStarted: 0,
-          completed: [],
-          blocked: [],
-          stillOpen: [],
-          proposed: 0,
-        }
-      }
+            // Only `todo` is admitted. `proposed` is not work yet, and `backlog` is
+            // not scheduled — a loop that reached into either would be doing exactly
+            // what the approval queue exists to prevent.
+            const candidates = board
+              .listTasks({
+                ...(args.projectId !== undefined ? { projectId: args.projectId } : {}),
+                status: 'todo',
+              })
+              .sort(byPriority)
+              .slice(0, resolved.maxIssues)
+            if (candidates.length === 0) {
+              return {
+                runId: '',
+                roundsStarted: 0,
+                completed: [],
+                blocked: [],
+                stillOpen: [],
+                proposed: 0,
+              }
+            }
 
-      const actor = agentActor(parent.id)
-      const proposedBefore = board.listTasks({ status: 'proposed' }).length
+            const actor = agentActor(parent.id)
+            const proposedBefore = board.listTasks({ status: 'proposed' }).length
 
-      // Claim the issues before any worker starts, so a human watching the board
-      // sees the run take them rather than discovering it afterwards.
-      for (const task of candidates) {
-        await board.updateTask(task.id, { status: 'in_progress' }, { actor, expectedVersion: task.version })
-        await board.record(task.id, 'plan-claimed', actor, { runOf: parent.id })
-      }
+            // Claim the issues before any worker starts, so a human watching the board
+            // sees the run take them rather than discovering it afterwards.
+            for (const task of candidates) {
+              await board.updateTask(
+                task.id,
+                { status: 'in_progress' },
+                { actor, expectedVersion: task.version },
+              )
+              await board.record(task.id, 'plan-claimed', actor, { runOf: parent.id })
+            }
 
-      const run = ctx.workflowEngine.start({
-        script: PLAN_SCRIPT,
-        meta: PLAN_META,
-        args: {
-          issues: candidates.map(task => ({
-            id: task.id,
-            title: task.title,
-            description: task.description,
-          })),
-          maxRounds,
-          maxHandoffChars: resolved.maxHandoffChars,
-        },
-        subagentProvider: resolved.subagentProvider,
-        maxTotalAgents: maxRounds,
-        parent,
-        signal: exec.signal,
-      })
+            const run = ctx.workflowEngine.start({
+              script: PLAN_SCRIPT,
+              meta: PLAN_META,
+              args: {
+                issues: candidates.map(task => ({
+                  id: task.id,
+                  title: task.title,
+                  description: task.description,
+                })),
+                maxRounds,
+                maxHandoffChars: resolved.maxHandoffChars,
+              },
+              subagentProvider: resolved.subagentProvider,
+              maxTotalAgents: maxRounds,
+              parent,
+              signal: exec.signal,
+            })
 
-      const onAbort = () => { run.cancel('parent step aborted') }
-      exec.signal.addEventListener('abort', onAbort, { once: true })
-      if (exec.signal.aborted) run.cancel('parent step aborted')
+            const onAbort = () => {
+              run.cancel('parent step aborted')
+            }
+            exec.signal.addEventListener('abort', onAbort, { once: true })
+            if (exec.signal.aborted) run.cancel('parent step aborted')
 
-      try {
-        const settled = await run.result
-        // Cancellation and failure are never success, and a half-finished run is
-        // never reported as a finished one.
-        if (settled.stopReason !== 'completed') {
-          throw new Error(`taskboard_plan ${settled.stopReason}: ${settled.error ?? 'no detail'}`)
-        }
-        const value = readRunValue(settled.value)
+            try {
+              const settled = await run.result
+              // Cancellation and failure are never success, and a half-finished run is
+              // never reported as a finished one.
+              if (settled.stopReason !== 'completed') {
+                throw new Error(
+                  `taskboard_plan ${settled.stopReason}: ${settled.error ?? 'no detail'}`,
+                )
+              }
+              const value = readRunValue(settled.value)
 
-        const completed: string[] = []
-        const blocked: string[] = []
-        for (const record of value.rounds) {
-          await applyRound(ctx, record, actor)
-          if (record.report.status === 'complete') completed.push(record.issueId)
-          if (record.report.status === 'blocked') blocked.push(record.issueId)
-        }
+              const completed: string[] = []
+              const blocked: string[] = []
+              for (const record of value.rounds) {
+                await applyRound(ctx, record, actor)
+                if (record.report.status === 'complete') completed.push(record.issueId)
+                if (record.report.status === 'blocked') blocked.push(record.issueId)
+              }
 
-        const stillOpen = board
-          .listTasks({ status: 'in_progress' })
-          .filter(task => candidates.some(candidate => candidate.id === task.id))
-          .map(task => task.id)
+              const stillOpen = board
+                .listTasks({ status: 'in_progress' })
+                .filter(task => candidates.some(candidate => candidate.id === task.id))
+                .map(task => task.id)
 
-        if (value.failedIssueId !== undefined) {
-          throw new Error(`taskboard_plan round failed on issue ${value.failedIssueId} after ${value.roundsStarted} round(s)`)
-        }
+              if (value.failedIssueId !== undefined) {
+                throw new Error(
+                  `taskboard_plan round failed on issue ${value.failedIssueId} after ${value.roundsStarted} round(s)`,
+                )
+              }
 
-        return {
-          runId: run.id,
-          roundsStarted: value.roundsStarted,
-          completed,
-          blocked,
-          stillOpen,
-          proposed: board.listTasks({ status: 'proposed' }).length - proposedBefore,
-        }
-      } finally {
-        exec.signal.removeEventListener('abort', onAbort)
-        await run.dispose()
-      }
-    },
-  })), 'taskboard: plan loop tool')
+              return {
+                runId: run.id,
+                roundsStarted: value.roundsStarted,
+                completed,
+                blocked,
+                stillOpen,
+                proposed: board.listTasks({ status: 'proposed' }).length - proposedBefore,
+              }
+            } finally {
+              exec.signal.removeEventListener('abort', onAbort)
+              await run.dispose()
+            }
+          },
+        }),
+      ),
+    'taskboard: plan loop tool',
+  )
 }
 
 /** Priority order for admission: urgent first, `none` last. */
@@ -438,8 +479,9 @@ const PRIORITY_ORDER: Record<Task['priority'], number> = {
 
 /** Sort comparator by priority then sort key. @param a - Left. @param b - Right. @returns the ordering. */
 export function byPriority(a: Task, b: Task): number {
-  return (PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority])
-    || (Number(a.sortKey) - Number(b.sortKey))
+  return (
+    PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority] || Number(a.sortKey) - Number(b.sortKey)
+  )
 }
 
 /**
@@ -464,10 +506,16 @@ export async function applyRound(
   const body = [
     `**Round ${record.round}: ${report.status}**`,
     report.summary,
-    report.evidence.length > 0 ? `Evidence:\n${report.evidence.map(line => `- ${line}`).join('\n')}` : '',
-    report.nextSteps.length > 0 ? `Next:\n${report.nextSteps.map(line => `- ${line}`).join('\n')}` : '',
+    report.evidence.length > 0
+      ? `Evidence:\n${report.evidence.map(line => `- ${line}`).join('\n')}`
+      : '',
+    report.nextSteps.length > 0
+      ? `Next:\n${report.nextSteps.map(line => `- ${line}`).join('\n')}`
+      : '',
     report.blocker === '' ? '' : `Blocked: ${report.blocker}`,
-  ].filter(Boolean).join('\n\n')
+  ]
+    .filter(Boolean)
+    .join('\n\n')
   await board.addComment(task.id, body, actor)
 
   const next = STATUS_FOR[report.status]

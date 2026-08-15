@@ -91,8 +91,13 @@ export function nextRunAtMs(expr: string, fromMs: number): number | undefined {
   const from = new Date(fromMs)
   // Scan from the next minute; Date rolls overflow (Feb 30 → Mar 2) for free.
   const scan = new Date(
-    from.getFullYear(), from.getMonth(), from.getDate(),
-    from.getHours(), from.getMinutes() + 1, 0, 0,
+    from.getFullYear(),
+    from.getMonth(),
+    from.getDate(),
+    from.getHours(),
+    from.getMinutes() + 1,
+    0,
+    0,
   )
   const limitMs = fromMs + 366 * 24 * 60 * 60 * 1000
   while (scan.getTime() <= limitMs) {
@@ -118,7 +123,15 @@ function parseField(field: string, min: number, max: number, out: Set<number>): 
       high = max
     } else if (range !== undefined && range.includes('-')) {
       const [a, b] = range.split('-')
-      if (a === undefined || b === undefined || a === '' || b === '' || !isDigits(a) || !isDigits(b)) return false
+      if (
+        a === undefined ||
+        b === undefined ||
+        a === '' ||
+        b === '' ||
+        !isDigits(a) ||
+        !isDigits(b)
+      )
+        return false
       low = Number(a)
       high = Number(b)
     } else if (range !== undefined && isDigits(range)) {

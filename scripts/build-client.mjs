@@ -7,15 +7,25 @@
 // dsh's own client packages ship bundled for the same reason. Types are checked
 // separately by `tsc --emitDeclarationOnly`.
 //
-// `id` MUST equal the package name — the graph row id comes from the mounted
-// plugin row's name, and the module table matches on it (docs/spike-findings.md §1).
-import { build } from 'esbuild'
+// `id` MUST equal the MOUNTED PLUGIN ROW's name (cordis.patch.yml): the graph
+// row the browser manifest carries comes from that name, and the module table
+// matches on it (docs/spike-findings.md §1). The npm package name is NOT the
+// authority — the repo is published under the @ericjiang0423 scope while local
+// profiles link it into node_modules under the row name, and a mismatch here
+// makes the browser fetch one id and load another (the plugin then never
+// applies). The row name keeps both local links and scoped npm installs
+// (whose profile patch overrides the row's name) correct automatically.
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 
 const root = dirname(fileURLToPath(new URL('../package.json', import.meta.url)))
-const { name: id } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+const { name: packageName } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+const patch = await readFile(join(root, 'cordis.patch.yml'), 'utf8')
+// The `taskboard` row's mounted name; falls back to the package name when the
+// patch file does not carry a row in the expected shape.
+const id = patch.match(/- id:\s*taskboard\s*\n\s*name:\s*(\S+)/)?.[1] ?? packageName
 const outputPath = join(root, 'lib', 'client.js')
 
 // React and every dsh client package come from the host's module table.
