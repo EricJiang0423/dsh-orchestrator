@@ -80,6 +80,7 @@ const targets = [
 let patched = 0
 let skipped = 0
 let missing = 0
+let failed = 0
 
 for (const target of targets) {
   let source
@@ -95,7 +96,8 @@ for (const target of targets) {
   for (const replacement of target.replacements) {
     if (next.includes(replacement.marker)) continue
     if (!next.includes(replacement.from)) {
-      console.warn(`[patch-pi-ai] pattern not found: ${target.path}`)
+      console.error(`[patch-pi-ai] pattern not found: ${target.path} — the package version likely changed; re-derive the anchors`)
+      failed += 1
       continue
     }
     next = next.replace(replacement.from, replacement.to)
@@ -110,5 +112,8 @@ for (const target of targets) {
   }
 }
 
-console.log(`[patch-pi-ai] done: ${patched} patched, ${skipped} already-fine, ${missing} missing`)
-if (missing > 0) process.exitCode = 0
+console.log(`[patch-pi-ai] done: ${patched} patched, ${skipped} already-fine, ${missing} missing, ${failed} failed`)
+// A missing file is tolerated (the patched provider may be optional in some
+// installs), but a file whose anchors no longer match means the patch silently
+// stopped applying — fail the install so CI and local dev both notice.
+if (failed > 0) process.exitCode = 1

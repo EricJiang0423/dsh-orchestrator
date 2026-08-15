@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: npm ci + npm run check (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # postinstall (patch-pi-ai-deepseek-reasoning etc.) runs here; a patch
+      # that no longer applies fails this step instead of degrading silently.
+      - run: npm ci
+
+      # build (tsc x2 + client bundle) and the full node:test suite.
+      - run: npm run check
