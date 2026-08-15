@@ -63,24 +63,29 @@
 - Node.js 22.5+
 - 一个正在运行的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) profile
 
-### 安装
+### 从源码安装（推荐）
+
+克隆、构建，并把 checkout 链接进 profile。在 checkout 目录内执行 `dsh plugin add .` 会注册这份本地构建，之后重新 `npm run build` 即可生效，无需重装：
 
 ```bash
-dsh plugin --profile web add dsh-orchestrator
+git clone https://github.com/EricJiang0423/dsh-orchestrator.git
+cd dsh-orchestrator
+npm install && npm run build
+dsh plugin --profile web add .
+```
+
+### 从 npm 安装（registry）
+
+> ⚠️ registry 上不带 scope 的 `dsh-orchestrator` 属于另一个无关项目（zibo/dsh-agent-mesh）。本项目以带 scope 的名字发布：
+
+```bash
+dsh plugin --profile web add @ericjiang0423/dsh-orchestrator
 ```
 
 ### 运行
 
 ```bash
 dsh --profile web
-```
-
-### 从源码构建
-
-```bash
-git clone https://github.com/EricJiang0423/dsh-orchestrator.git
-cd dsh-orchestrator
-npm install && npm run build
 ```
 
 ---
@@ -96,7 +101,7 @@ npm install && npm run build
 ### 从别的插件读写看板
 
 ```ts
-import type {} from 'dsh-orchestrator'
+import type {} from '@ericjiang0423/dsh-orchestrator'
 
 export const inject = ['taskboard']
 

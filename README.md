@@ -63,24 +63,29 @@ The board rendered with sample data — no project details from any real deploym
 - Node.js 22.5+
 - A running [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) profile
 
-### Install
+### Install from source (recommended)
+
+Clone, build, and link the checkout into the profile. `dsh plugin add .` from inside the checkout registers the local build, so later `npm run build` runs are picked up without reinstalling:
 
 ```bash
-dsh plugin --profile web add dsh-orchestrator
+git clone https://github.com/EricJiang0423/dsh-orchestrator.git
+cd dsh-orchestrator
+npm install && npm run build
+dsh plugin --profile web add .
+```
+
+### Install from npm (registry)
+
+> ⚠️ The unscoped `dsh-orchestrator` on the registry belongs to an unrelated project (zibo/dsh-agent-mesh). This project is published under a scope:
+
+```bash
+dsh plugin --profile web add @ericjiang0423/dsh-orchestrator
 ```
 
 ### Run
 
 ```bash
 dsh --profile web
-```
-
-### From source
-
-```bash
-git clone https://github.com/EricJiang0423/dsh-orchestrator.git
-cd dsh-orchestrator
-npm install && npm run build
 ```
 
 ---
@@ -96,7 +101,7 @@ npm install && npm run build
 ### Call the board from another plugin
 
 ```ts
-import type {} from 'dsh-orchestrator'
+import type {} from '@ericjiang0423/dsh-orchestrator'
 
 export const inject = ['taskboard']
 

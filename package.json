@@ -1,5 +1,5 @@
 {
-  "name": "dsh-orchestrator",
+  "name": "@ericjiang0423/dsh-orchestrator",
   "version": "0.1.0",
   "description": "Local-first issue board for DeepSeek Harness: board data, model-facing tools, an agent planning loop, and a human approval queue for agent-proposed issues.",
   "keywords": [
