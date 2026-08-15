@@ -94,6 +94,19 @@ async function dispatch(
       const { id } = p as unknown as ParamsOf<'task.start'>
       return startTask(ctx, board, id)
     }
+    case 'task.rerun': {
+      // Re-run of a settled/finished issue: startTask's live-session guard would
+      // return the stale idle session, so force a fresh one.
+      const { id } = p as unknown as ParamsOf<'task.rerun'>
+      return startTask(ctx, board, id, { force: true })
+    }
+    case 'task.schedule': {
+      const { id, patch, expectedVersion } = p as unknown as ParamsOf<'task.schedule'>
+      return board.updateScheduleRule(id, patch, {
+        actor: LOCAL_USER,
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+      })
+    }
     case 'task.startNext': {
       const { projectId } = p as unknown as ParamsOf<'task.startNext'>
       return startNextTask(ctx, board, projectId)

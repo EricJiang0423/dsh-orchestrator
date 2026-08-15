@@ -32,6 +32,7 @@
   "files": [
     "lib",
     "src",
+    "scripts",
     "skills",
     "cordis.patch.yml",
     "README.md",
@@ -39,6 +40,7 @@
     "NOTICE"
   ],
   "scripts": {
+    "postinstall": "node scripts/patch-pi-ai-deepseek-reasoning.mjs",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "prepack": "npm run build",
     "test": "node --test test/*.test.js",

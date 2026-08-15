@@ -21,14 +21,18 @@ import {
   type Actor,
   type Comment,
   type CommentId,
+  type ExecutionRecord,
+  type ExecutionResult,
   type Project,
   type ProjectId,
   type SchedulerSettings,
+  type ScheduleRule,
   type SettingsKey,
   type Task,
   type TaskId,
   type TaskStatus,
 } from './domain.ts'
+import { isValidCron, nextRunAtMs } from './schedule.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -265,6 +269,194 @@ export class Taskboard extends Service {
     return this.tasks.get(id as TaskId)
   }
 
+  // ── executions ─────────────────────────────────────────────────────────────
+
+  /**
+   * Open a fresh execution attempt on an issue and bind it to a session.
+   *
+   * One atomic CAS write (the record's `update` runs inside the write chain),
+   * so the execution append and the `in_progress` / session binding can never
+   * interleave past a concurrent writer. Unlike {@link updateTask}, this is a
+   * system-managed write: executions are not in the user-editable patch set.
+   * @param id - Task id.
+   * @param sessionId - The dsh session that will do the work.
+   * @param opts - Who is writing, which version they read, and the optional
+   *   status move (defaults to leaving the current status).
+   * @returns the stored issue.
+   */
+  async openExecution(
+    id: string,
+    sessionId: string,
+    opts: { actor: Actor; expectedVersion?: number; status?: TaskStatus },
+  ): Promise<Task> {
+    return this.tasks.update(id as TaskId, current => {
+      if (opts.expectedVersion !== undefined && current.version !== opts.expectedVersion) {
+        throw new TaskboardError(
+          'version-conflict',
+          `task "${id}" is at version ${current.version}, not ${opts.expectedVersion}`,
+        )
+      }
+      if (opts.status !== undefined
+        && opts.status !== current.status
+        && !canTransition(current.status, opts.status, opts.actor.type)) {
+        throw new TaskboardError(
+          'forbidden-transition',
+          `${opts.actor.type} may not move "${current.status}" to "${opts.status}"`,
+        )
+      }
+      const execution: ExecutionRecord = {
+        id: crypto.randomUUID(),
+        sessionId,
+        startedAt: Date.now(),
+      }
+      const next: Task = {
+        ...current,
+        executions: [...current.executions, execution],
+        sessionId,
+        ...(opts.status !== undefined && opts.status !== current.status ? { status: opts.status } : {}),
+        version: current.version + 1,
+        updatedAt: new Date().toISOString(),
+      }
+      return next
+    })
+  }
+
+  /**
+   * Settle one open execution attempt.
+   *
+   * A no-op when the execution is not the task's open attempt or already
+   * settled, so a late `turn-stopping` after an earlier `agent/error` (or vice
+   * versa) cannot flip a settled result. Like {@link openExecution}, this is a
+   * system-managed write.
+   * @param id - Task id.
+   * @param result - How the run settled.
+   * @param opts - Actor, optional version fence, and failure text / optional
+   *   status move (used by the mount-time reconcile to land `failed`).
+   * @returns the stored issue.
+   */
+  async settleExecution(
+    id: string,
+    result: ExecutionResult,
+    opts: { actor: Actor; expectedVersion?: number; error?: string; status?: TaskStatus },
+  ): Promise<Task> {
+    const before = this.tasks.get(id as TaskId)
+    if (before === undefined) throw new TaskboardError('not-found', `task "${id}" does not exist`)
+    return this.tasks.update(id as TaskId, current => {
+      if (opts.expectedVersion !== undefined && current.version !== opts.expectedVersion) {
+        throw new TaskboardError(
+          'version-conflict',
+          `task "${id}" is at version ${current.version}, not ${opts.expectedVersion}`,
+        )
+      }
+      // The latest open execution is the one in flight; settle only it.
+      const index = current.executions.findIndex(execution => execution.endedAt === undefined)
+      if (index === -1) return current
+      const open = current.executions[index]!
+      const settled: ExecutionRecord = {
+        id: open.id,
+        startedAt: open.startedAt,
+        ...(open.sessionId !== undefined ? { sessionId: open.sessionId } : {}),
+        endedAt: Date.now(),
+        result,
+        ...(opts.error !== undefined ? { error: opts.error } : {}),
+      }
+      const executions = [...current.executions]
+      executions[index] = settled
+      const next: Task = {
+        ...current,
+        executions,
+        ...(opts.status !== undefined && opts.status !== current.status ? { status: opts.status } : {}),
+        version: current.version + 1,
+        updatedAt: new Date().toISOString(),
+      }
+      return next
+    })
+  }
+
+  // ── schedule ───────────────────────────────────────────────────────────────
+
+  /**
+   * Set an issue's cron schedule rule.
+   *
+   * Arm/disarm and change the expression in one write. Enabling (or changing
+   * the expression while enabled) computes the next run instant immediately;
+   * disabling clears `nextRunAt` so a stale due instant can never linger in
+   * storage. A blank or invalid expression is rejected.
+   * @param id - Task id.
+   * @param patch - Rule fields; omitted fields keep their stored value.
+   * @param opts - Who is writing, and which version they read.
+   * @param nowMs - Clock, injectable for tests.
+   * @returns the stored issue.
+   */
+  async updateScheduleRule(
+    id: string,
+    patch: { enabled?: boolean; cron?: string },
+    opts: { actor: Actor; expectedVersion?: number },
+    nowMs: number = Date.now(),
+  ): Promise<Task> {
+    const before = this.tasks.get(id as TaskId)
+    if (before === undefined) throw new TaskboardError('not-found', `task "${id}" does not exist`)
+    const current = before.schedule
+    const cron = (patch.cron ?? current?.cron ?? '').trim()
+    if (cron === '' || !isValidCron(cron)) {
+      throw new TaskboardError('invalid-input', `task "${id}" has an invalid schedule expression`)
+    }
+    const enabled = patch.enabled ?? current?.enabled ?? false
+    const now = new Date().toISOString()
+    return this.tasks.update(id as TaskId, stored => {
+      if (opts.expectedVersion !== undefined && stored.version !== opts.expectedVersion) {
+        throw new TaskboardError(
+          'version-conflict',
+          `task "${id}" is at version ${stored.version}, not ${opts.expectedVersion}`,
+        )
+      }
+      const nextRunAt = enabled ? nextRunAtMs(cron, nowMs) : undefined
+      const schedule: ScheduleRule = {
+        enabled,
+        cron,
+        // `nextRunAt` lives only while enabled AND a match exists within the
+        // scan horizon; a disabled rule carries neither the due instant nor a
+        // stale one from storage.
+        ...(nextRunAt !== undefined ? { nextRunAt } : {}),
+        ...(current?.lastTriggeredAt !== undefined ? { lastTriggeredAt: current.lastTriggeredAt } : {}),
+      }
+      return { ...stored, schedule, version: stored.version + 1, updatedAt: now }
+    })
+  }
+
+  /**
+   * Roll an enabled schedule forward (scheduler callback): persist the next
+   * due instant and, when a run actually fired, the trigger instant of that
+   * run. A skip / repair passes no trigger and preserves the stored one. No-op
+   * for a task without a rule — it may have been deleted mid-tick.
+   * @param id - Task id.
+   * @param next - The next run's computed due instant.
+   * @param trigger - The actual trigger instant of this run, when one fired.
+   * @returns the stored issue.
+   */
+  async rollSchedule(
+    id: string,
+    next: number | undefined,
+    trigger?: number,
+  ): Promise<Task | undefined> {
+    const before = this.tasks.get(id as TaskId)
+    // Missing task or a rule that vanished since the tick read it: no-op.
+    if (before === undefined || before.schedule === undefined) return undefined
+    const now = new Date().toISOString()
+    return this.tasks.update(id as TaskId, stored => {
+      if (stored.schedule === undefined) return stored
+      const nextRunAt = next !== undefined ? next : stored.schedule.nextRunAt
+      const lastTriggeredAt = trigger !== undefined ? trigger : stored.schedule.lastTriggeredAt
+      const rolled: ScheduleRule = {
+        enabled: stored.schedule.enabled,
+        cron: stored.schedule.cron,
+        ...(nextRunAt !== undefined ? { nextRunAt } : {}),
+        ...(lastTriggeredAt !== undefined ? { lastTriggeredAt } : {}),
+      }
+      return { ...stored, schedule: rolled, version: stored.version + 1, updatedAt: now }
+    })
+  }
+
   /**
    * Create an issue and record who asked for it.
    * @param input - Issue fields; `status` defaults to `backlog`.
@@ -295,6 +487,7 @@ export class Taskboard extends Service {
       version: 0,
       origin: input.origin ?? creator.type,
       ...(input.proposedBy !== undefined ? { proposedBy: input.proposedBy } : {}),
+      executions: [],
       createdAt: now,
       updatedAt: now,
     }

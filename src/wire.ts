@@ -15,9 +15,36 @@
  */
 import type { Activity, Comment, Project, Task } from './domain.ts'
 import type { CreateTaskInput, TaskFilter, TaskboardErrorCode, UpdateTaskPatch } from './service.ts'
-import type { SchedulerConfig, SchedulerState } from './session-link.ts'
 
-export type { SchedulerConfig, SchedulerState }
+export type { ExecutionRecord, ExecutionResult, ScheduleRule } from './domain.ts'
+
+/** How many issues may run at once, and whether the board fills those slots itself. */
+export interface SchedulerConfig {
+  /** Issues allowed in flight at the same time. */
+  concurrency?: number
+  /** Whether the board pulls from `todo` on its own. */
+  autoPull?: boolean
+  /** Safety-net sweep interval in milliseconds. */
+  sweepIntervalMs?: number
+  /** Cron-check interval in milliseconds (cron is minute-granular). */
+  tickIntervalMs?: number
+}
+
+/** Live scheduler state, surfaced to the board so a human can see and change it. */
+export interface SchedulerState {
+  concurrency: number
+  autoPull: boolean
+  /** Issues currently in flight with a live session. */
+  running: number
+  /** Issues eligible to be picked up. */
+  waiting: number
+}
+
+/** Fields the schedule editor may change on a rule. */
+export interface SchedulePatch {
+  enabled?: boolean
+  cron?: string
+}
 
 /** Route prefix owned by this plugin; `/api` and `/plugins` belong to dsh. */
 export const ROUTE_PREFIX = '/_dsh/taskboard'
@@ -60,6 +87,10 @@ export interface TaskboardApi {
   'comment.create': { params: { taskId: string; body: string }; result: Comment }
   /** Open a fresh session for one issue and hand it the work. */
   'task.start': { params: { id: string }; result: Task }
+  /** Re-run a settled/finished issue in a FRESH session (the live-session guard does not block it). */
+  'task.rerun': { params: { id: string }; result: Task }
+  /** Arm/disarm or change an issue's cron schedule. */
+  'task.schedule': { params: { id: string; patch: SchedulePatch; expectedVersion?: number }; result: Task }
   /** Start the next todo issue — the board picks it. */
   'task.startNext': { params: { projectId?: string }; result: Task | null }
   /** The board this session belongs to, with live scheduler state. */
@@ -89,6 +120,8 @@ export const TASKBOARD_METHODS = [
   'task.update',
   'comment.create',
   'task.start',
+  'task.rerun',
+  'task.schedule',
   'task.startNext',
   'board.view',
   'task.accept',

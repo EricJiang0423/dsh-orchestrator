@@ -13,11 +13,12 @@
  * this session's own.
  * @module dsh-orchestrator/client/board
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, MarkdownText, Pill } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { Project, Task, TaskStatus } from '../domain.ts'
+import type { ExecutionRecord, Project, Task, TaskStatus } from '../domain.ts'
 import type { SchedulerState, TaskDetail } from '../wire.ts'
+import { isValidCron } from '../schedule.ts'
 import { RpcError, call, subscribe } from './rpc.ts'
 
 /**
@@ -34,6 +35,7 @@ const COLUMNS: readonly TaskStatus[] = [
   'in_review',
   'blocked',
   'done',
+  'failed',
 ]
 
 /** Column headings. `proposed` says what it wants from the reader. */
@@ -45,6 +47,7 @@ const COLUMN_LABEL: Record<TaskStatus, string> = {
   in_review: 'In review',
   blocked: 'Blocked',
   done: 'Done',
+  failed: 'Failed',
   canceled: 'Canceled',
 }
 
@@ -53,6 +56,40 @@ const PRIORITY_MARK: Partial<Record<Task['priority'], string>> = {
   urgent: '!!',
   high: '!',
   medium: '·',
+}
+
+/** Common scheduled-run presets: cron → label. */
+const SCHEDULE_PRESETS: ReadonlyArray<{ cron: string; label: string }> = [
+  { cron: '0 9 * * *', label: 'Daily 09:00' },
+  { cron: '0 * * * *', label: 'Hourly' },
+  { cron: '*/10 * * * *', label: 'Every 10 min' },
+  { cron: '0 9 * * 1', label: 'Weekly Mon 09:00' },
+]
+
+/** Compact relative/absolute time label. */
+function formatTime(ms: number): string {
+  const date = new Date(ms)
+  const now = Date.now()
+  const minutes = Math.floor((now - ms) / 60000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes}m`
+  if (minutes < 60 * 24) return `${Math.floor(minutes / 60)}h`
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+/** Result badge word for one settled execution. */
+function resultLabel(result: ExecutionRecord['result']): string {
+  if (result === 'succeeded') return 'succeeded'
+  if (result === 'failed') return 'failed'
+  if (result === 'canceled') return 'cancelled'
+  return 'running'
+}
+
+/** Case-insensitive title/description match. */
+function matchesFilter(task: Task, filter: string): boolean {
+  if (filter.trim() === '') return true
+  const needle = filter.trim().toLowerCase()
+  return task.title.toLowerCase().includes(needle) || task.description.toLowerCase().includes(needle)
 }
 
 /** The workspace board this session belongs to, with live scheduler state. */
@@ -70,22 +107,62 @@ interface BoardData {
  * @param props.onToggle - Open or close the detail.
  * @param props.onDecide - Approve or reject a proposal.
  * @param props.onStart - Open a fresh session for the issue.
+ * @param props.onRerun - Re-run a settled issue in a fresh session.
  * @param props.onAccept - Accept finished work (in_review → done).
  * @param props.onSendBack - Send finished work back to todo, with a reason.
+ * @param props.onSetSchedule - Arm/disarm or change the issue's cron rule.
+ * @param props.openSession - Jump to a session's conversation.
  * @returns the card element.
  */
-function Card({ task, expanded, detail, onToggle, onDecide, onStart, onAccept, onSendBack }: {
+function Card({ task, expanded, detail, onToggle, onDecide, onStart, onRerun, onAccept, onSendBack, onSetSchedule, openSession }: {
   task: Task
   expanded: boolean
   detail: TaskDetail | undefined
   onToggle: () => void
   onDecide: (task: Task, approve: boolean) => void
   onStart: (task: Task) => void
+  onRerun: (task: Task) => void
   onAccept: (task: Task) => void
   onSendBack: (task: Task, reason: string) => void
+  onSetSchedule: (task: Task, patch: { enabled?: boolean; cron?: string }) => void
+  openSession: (id: string) => void
 }) {
   const [reason, setReason] = useState('')
+  const [cron, setCron] = useState(task.schedule?.cron ?? '0 9 * * *')
+  const [cronError, setCronError] = useState<string | undefined>(undefined)
   const startable = task.status === 'backlog' || task.status === 'todo' || task.status === 'blocked'
+  // A settled (or dead) issue can be re-run from anywhere; `in_progress` cannot.
+  const rerunnable = task.status !== 'in_progress' && task.status !== 'proposed'
+  const latest = task.executions[task.executions.length - 1]
+  const runs = task.executions.length
+
+  useEffect(() => {
+    setCron(task.schedule?.cron ?? '0 9 * * *')
+    setCronError(undefined)
+  }, [task.id, task.schedule?.cron, task.schedule?.enabled])
+
+  const saveCron = (value: string): void => {
+    const trimmed = value.trim()
+    setCron(trimmed)
+    if (trimmed === '' || !isValidCron(trimmed)) {
+      setCronError('invalid cron — "分 时 日 月 周", e.g. 0 9 * * *')
+      return
+    }
+    setCronError(undefined)
+    if (trimmed !== task.schedule?.cron) onSetSchedule(task, { cron: trimmed })
+  }
+
+  const toggleSchedule = (enabled: boolean): void => {
+    const trimmed = cron.trim()
+    if (enabled && (trimmed === '' || !isValidCron(trimmed))) {
+      setCronError('invalid cron — "分 时 日 月 周", e.g. 0 9 * * *')
+      return
+    }
+    setCronError(undefined)
+    if (enabled && trimmed !== task.schedule?.cron) onSetSchedule(task, { cron: trimmed })
+    onSetSchedule(task, { enabled })
+  }
+
   return (
     <div className="tb-card" data-expanded={expanded ? 'true' : undefined}>
       <button type="button" className="tb-card-title" onClick={onToggle}>
@@ -110,10 +187,38 @@ function Card({ task, expanded, detail, onToggle, onDecide, onStart, onAccept, o
         </div>
       )}
 
+      {/* Card meta: run count + last result, schedule badge, relative time. */}
+      <div className="tb-meta">
+        {runs > 0 && latest !== undefined && (
+          <span className="tb-runs" data-result={latest.result}>
+            {runs} run{runs === 1 ? '' : 's'} · {resultLabel(latest.result)}
+          </span>
+        )}
+        {task.schedule?.enabled === true && (
+          <span
+            className="tb-sched-badge"
+            title={'scheduled · '
+              + (task.schedule.nextRunAt !== undefined
+                ? `next ${new Date(task.schedule.nextRunAt).toLocaleString()}`
+                : 'next run pending')}
+          >
+            ⏱ {task.schedule.cron}
+          </span>
+        )}
+        <span className="tb-time">updated {formatTime(Date.parse(task.updatedAt))}</span>
+      </div>
+
       {/* The issue's own session — opened by the scheduler or by hand. It shows
-          up in the session sidebar like any other session. */}
+          up in the session sidebar like any other session; clicking jumps there. */}
       {task.sessionId !== undefined && (
-        <span className="tb-bound">session {task.sessionId.slice(0, 8)}</span>
+        <button
+          type="button"
+          className="tb-session-chip"
+          onClick={() => { openSession(task.sessionId!) }}
+          title={`open session ${task.sessionId}`}
+        >
+          session {task.sessionId.slice(0, 8)} ⌁
+        </button>
       )}
 
       {expanded && startable && (
@@ -148,6 +253,80 @@ function Card({ task, expanded, detail, onToggle, onDecide, onStart, onAccept, o
         <div className="tb-detail">
           {task.description !== '' && <MarkdownText text={task.description} />}
           {task.labels.map(label => <Pill key={label}>{label}</Pill>)}
+
+          {/* Execution history, newest first — the attempt trail the board keeps. */}
+          {task.executions.length > 0 && (
+            <ol className="tb-executions">
+              {[...task.executions].reverse().map(execution => (
+                <li key={execution.id} data-result={execution.result}>
+                  <span className="tb-exec-badge" data-result={execution.result}>
+                    {resultLabel(execution.result)}
+                  </span>
+                  <span className="tb-exec-times">
+                    {formatTime(execution.startedAt)}
+                    {execution.endedAt !== undefined && ` → ${formatTime(execution.endedAt)}`}
+                  </span>
+                  {execution.sessionId !== undefined && (
+                    <button
+                      type="button"
+                      className="tb-link"
+                      onClick={() => { openSession(execution.sessionId!) }}
+                      title={execution.sessionId}
+                    >
+                      session ⌁
+                    </button>
+                  )}
+                  {execution.error !== undefined && execution.error !== '' && (
+                    <span className="tb-exec-error">{execution.error}</span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
+
+          {/* Schedule editor: enable toggle + cron input + presets. */}
+          <div className="tb-schedule">
+            <label className="tb-schedule-toggle">
+              <input
+                type="checkbox"
+                checked={task.schedule?.enabled === true}
+                onChange={event => { toggleSchedule(event.target.checked) }}
+              />
+              <span>Scheduled</span>
+            </label>
+            <input
+              className="tb-reason tb-cron"
+              value={cron}
+              spellCheck={false}
+              placeholder="0 9 * * *"
+              onChange={event => { setCron(event.target.value); setCronError(undefined) }}
+              onBlur={() => { saveCron(cron) }}
+              onKeyDown={event => { if (event.key === 'Enter') saveCron(cron) }}
+            />
+            <select
+              className="tb-preset"
+              value=""
+              onChange={event => { if (event.target.value !== '') saveCron(event.target.value) }}
+            >
+              <option value="">presets…</option>
+              {SCHEDULE_PRESETS.map(preset => (
+                <option key={preset.cron} value={preset.cron}>{preset.label}</option>
+              ))}
+            </select>
+            {cronError !== undefined && <span className="tb-error">{cronError}</span>}
+            {task.schedule?.enabled === true && task.schedule.nextRunAt !== undefined && (
+              <span className="tb-time">
+                next {new Date(task.schedule.nextRunAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+
+          {rerunnable && (
+            <div className="tb-decide">
+              <Button size="sm" variant="outline" onClick={() => { onRerun(task) }}>Rerun</Button>
+            </div>
+          )}
+
           {detail?.comments.map(comment => (
             <div key={comment.id} className="tb-comment">
               <span className="tb-comment-author">{comment.author.name}</span>
@@ -167,11 +346,16 @@ function Card({ task, expanded, detail, onToggle, onDecide, onStart, onAccept, o
   )
 }
 
+/** Memoized card: re-renders only when its own task or its callbacks change. */
+const MemoCard = memo(Card)
+
 /**
  * The board.
  * @returns the board element.
  */
-export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
+export function BoardView({ sessionId, openSession }: PropsRuntime<'conversation.view'> & {
+  openSession: (id: string) => void
+}) {
   const [view, setView] = useState<BoardData | undefined>(undefined)
   const [projects, setProjects] = useState<Project[]>([])
   // undefined = this session's own workspace board; a project id = that board.
@@ -181,6 +365,7 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
   const [detail, setDetail] = useState<TaskDetail | undefined>(undefined)
   const [error, setError] = useState<string | undefined>(undefined)
   const [concurrency, setConcurrency] = useState('1')
+  const [filter, setFilter] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -248,6 +433,29 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
     }
   }, [refresh])
 
+  const rerun = useCallback(async (task: Task) => {
+    try {
+      // Same as start, but the host ALWAYS opens a fresh session — a settled
+      // issue still holds an idle session in the registry.
+      await call('task.rerun', { id: task.id })
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }, [refresh])
+
+  const setSchedule = useCallback(async (task: Task, patch: { enabled?: boolean; cron?: string }) => {
+    try {
+      await call('task.schedule', { id: task.id, patch, expectedVersion: task.version })
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof RpcError && cause.code === 'invalid-input'
+        ? 'Invalid schedule expression.'
+        : cause instanceof Error ? cause.message : String(cause))
+      await refresh()
+    }
+  }, [refresh])
+
   // The board knows what is next; picking a card by hand to start the obvious
   // one is busywork. With no project pill active this pulls from every board's
   // todo, exactly like the scheduler does.
@@ -312,15 +520,20 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
   const byStatus = useMemo(() => {
     const groups = new Map<TaskStatus, Task[]>()
     for (const task of tasks) {
+      if (!matchesFilter(task, filter)) continue
       const bucket = groups.get(task.status)
       if (bucket === undefined) groups.set(task.status, [task])
       else bucket.push(task)
     }
     return groups
-  }, [tasks])
+  }, [tasks, filter])
 
   const waiting = byStatus.get('proposed')?.length ?? 0
   const todoCount = byStatus.get('todo')?.length ?? 0
+
+  const openTask = useCallback((id: string) => {
+    setOpenId(openId === id ? undefined : id)
+  }, [openId])
 
   return (
     <div className="tb-root">
@@ -341,6 +554,14 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
               {project.name}
             </Pill>
           ))}
+        <input
+          className="tb-search"
+          type="search"
+          placeholder="filter by title or description…"
+          value={filter}
+          onChange={event => { setFilter(event.target.value) }}
+          aria-label="filter issues"
+        />
         <span className="tb-bar-end">
           {waiting > 0 && <span className="tb-waiting">{waiting} waiting for you</span>}
           {todoCount > 0 && (
@@ -391,16 +612,19 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
                 <span className="tb-count">{column.length}</span>
               </h3>
               {column.map(task => (
-                <Card
+                <MemoCard
                   key={task.id}
                   task={task}
                   expanded={openId === task.id}
                   detail={openId === task.id ? detail : undefined}
-                  onToggle={() => { setOpenId(openId === task.id ? undefined : task.id) }}
+                  onToggle={() => { openTask(task.id) }}
                   onDecide={(target, approve) => { void decide(target, approve) }}
                   onStart={target => { void start(target) }}
+                  onRerun={target => { void rerun(target) }}
                   onAccept={target => { void accept(target) }}
                   onSendBack={(target, reason) => { void sendBack(target, reason) }}
+                  onSetSchedule={(target, patch) => { void setSchedule(target, patch) }}
+                  openSession={openSession}
                 />
               ))}
             </section>
@@ -412,6 +636,9 @@ export function BoardView({ sessionId }: PropsRuntime<'conversation.view'>) {
         <p className="tb-empty">
           No issues yet. Add one with <code>/task &lt;title&gt;</code> in the chat.
         </p>
+      )}
+      {tasks.length > 0 && byStatus.size === 0 && (
+        <p className="tb-empty">No issues match the filter.</p>
       )}
     </div>
   )

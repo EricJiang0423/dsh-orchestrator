@@ -37,9 +37,51 @@ export const TASK_STATUSES = [
   'in_review',
   'blocked',
   'done',
+  'failed',
   'canceled',
 ] as const
 export type TaskStatus = (typeof TASK_STATUSES)[number]
+
+/** How one execution attempt settled. `canceled` is kept for future aborts. */
+export const EXECUTION_RESULTS = ['succeeded', 'failed', 'canceled'] as const
+export type ExecutionResult = (typeof EXECUTION_RESULTS)[number]
+
+/**
+ * One real execution attempt of an issue.
+ *
+ * Times are millisecond epochs (unlike the ISO strings on `createdAt` /
+ * `updatedAt`) because the cron scheduler compares them numerically and the
+ * browser half renders them as relative "3m / 2h" labels — see
+ * {@link nextRunAtMs} in ./schedule.ts. A session id is filled when the attempt
+ * was bound to a dsh session; `endedAt` / `result` stay absent until the turn
+ * settles.
+ */
+export interface ExecutionRecord {
+  /** Execution attempt id (uuid). */
+  id: string
+  /** The dsh session that ran this attempt; absent until the session is created. */
+  sessionId?: string
+  /** When the run started (ms epoch). */
+  startedAt: number
+  /** When the run settled; absent while still running. */
+  endedAt?: number
+  /** How it settled, once the turn stopped or failed. */
+  result?: ExecutionResult
+  /** Human-readable failure text, carried only for failed runs. */
+  error?: string
+}
+
+/** A scheduled-run rule attached to an issue. Times are ms epochs. */
+export interface ScheduleRule {
+  /** Whether the schedule is armed. */
+  enabled: boolean
+  /** 5-field cron expression: `分 时 日 月 周`. */
+  cron: string
+  /** Next due instant (ms epoch); always absent while disabled. */
+  nextRunAt?: number
+  /** Instant of the latest scheduled trigger (ms epoch). */
+  lastTriggeredAt?: number
+}
 
 /** Priority ladder, unchanged from the original board. */
 export const TASK_PRIORITIES = ['none', 'urgent', 'high', 'medium', 'low'] as const
@@ -63,6 +105,22 @@ export type Actor = z.infer<typeof actorSchema>
 const relationSchema = z.object({
   type: z.enum(RELATION_TYPES),
   targetId: z.string(),
+})
+
+const executionRecordSchema = z.object({
+  id: z.string(),
+  sessionId: z.string().optional(),
+  startedAt: z.number(),
+  endedAt: z.number().optional(),
+  result: z.enum(EXECUTION_RESULTS).optional(),
+  error: z.string().optional(),
+})
+
+const scheduleSchema = z.object({
+  enabled: z.boolean(),
+  cron: z.string(),
+  nextRunAt: z.number().optional(),
+  lastTriggeredAt: z.number().optional(),
 })
 
 const projectSchema = z.object({
@@ -111,6 +169,10 @@ const taskSchema = z.object({
   origin: z.enum(ACTOR_TYPES).default('user'),
   /** Which agent proposed it, and on which planning round. */
   proposedBy: z.object({ agent: z.string(), round: z.number().int().optional() }).optional(),
+  /** Every execution attempt, most recent last. */
+  executions: z.array(executionRecordSchema).default([]),
+  /** Optional cron-scheduled run rule. */
+  schedule: scheduleSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })

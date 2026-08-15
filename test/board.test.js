@@ -9,7 +9,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { Taskboard, TaskboardError, canTransition } from '../lib/index.js'
-import { Scheduler, resolveProject, startNextTask, startTask } from '../lib/session-link.js'
+import {
+  Scheduler, reconcileOrphans, resolveProject, selectionRefFor, startNextTask, startTask,
+} from '../lib/session-link.js'
+import { nextRunAtMs } from '../lib/schedule.js'
 
 /** One table over a Map, with the domain's write-chain semantics. */
 function fakeTable() {
@@ -77,17 +80,19 @@ async function boardFixture(options = {}) {
       create(_agent, request) { this.created.push(request) }
     }
     // The harness's default model selection — spawned issue sessions must
-    // inherit it, or their prompt assembly fails on the `{{model}}` variable.
+    // inherit it (provider, model, AND reasoning effort), or their request
+    // routing falls back to the adapter default instead of the user's choice.
     class DefaultModel extends Service {
       constructor(context) { super(context, 'agentDefaultModel') }
-      currentSelection() { return { provider: 'deepseek-official', model: 'deepseek-v4-flash' } }
+      currentSelection() { return { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'max' } }
     }
     // The default agent preset — without it a spawned session has no working
     // tool kit (no file tools, no shell), so it cannot do the work.
     class Presets extends Service {
       constructor(context) { super(context, 'agentPresets') }
+      mounts = []
       async resolve() { return { id: 'standard' } }
-      async mount() { return { id: 'standard' } }
+      async mount(ctx, id) { this.mounts.push({ ctx, id }) }
     }
     ctx.plugin(Agents)
     ctx.plugin(Goals)
@@ -243,11 +248,35 @@ test('starting an issue opens a fresh session, moves it, and hands it over', asy
   assert.equal(started.status, 'in_progress')
   assert.equal(ctx.agents.entries.length, 1)
   assert.equal(ctx.agents.entries[0].options.meta.cwd, '/repo')
+  // AgentOptions has NO reasoningEffort field — the effort must NOT be dropped,
+  // so it travels instead through installModelSelection in setup (below).
   assert.deepEqual(ctx.agents.entries[0].options.agentOptions, {
     provider: 'deepseek-official',
     model: 'deepseek-v4-flash',
   })
   assert.equal(ctx.agents.entries[0].options.meta.agentPreset, 'standard')
+
+  // The setup callback composes the scoped world: the default preset's tools
+  // AND the full model selection (effort included) through selectionRefFor.
+  const setup = ctx.agents.entries[0].options.setup
+  assert.equal(typeof setup, 'function')
+  // A context whose event surface suppresses registration so installModelSelection
+  // (the real dsh-agent helper) runs without a full agent scope.
+  const fakeAgentCtx = { on: () => () => {} }
+  await setup(fakeAgentCtx)
+  assert.equal(ctx.agentPresets.mounts.length, 1)
+  assert.equal(ctx.agentPresets.mounts[0].id, 'standard')
+  // The selection ref must carry the FULL selection, reasoningEffort and all.
+  assert.deepEqual(selectionRefFor({ provider: 'p', model: 'm', reasoningEffort: 'max' }), {
+    current: { provider: 'p', model: 'm', reasoningEffort: 'max' },
+    assembled: undefined,
+  })
+
+  // One execution record was opened and bound to the spawned session.
+  assert.equal(started.executions.length, 1)
+  assert.equal(started.executions[0].sessionId, started.sessionId)
+  assert.equal(started.executions[0].result, undefined)
+  assert.equal(started.executions[0].endedAt, undefined)
 
   // The agent was handed the issue, not just told about it.
   const agent = ctx.agents.get(started.sessionId)
@@ -443,4 +472,168 @@ test('a dead session frees its slot for the next issue', async () => {
   assert.equal(inProgress.length, 2)
   assert.equal(inProgress.filter(task => ctx.agents.get(task.sessionId) !== undefined).length, 1)
   assert.equal(scheduler.state('p1').running, 1)
+})
+
+// ── executions ────────────────────────────────────────────────────────────────
+
+test('a re-run forces a fresh session even when a live one is idle-bound', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Do it again', status: 'todo' }, human)
+
+  // First run binds a session; the agent stays live (idle after its turn).
+  const first = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id))
+  assert.equal(ctx.agents.entries.length, 1)
+
+  // A second ordinary start is refused — that is the no-double-start guard.
+  const guarded = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id))
+  assert.equal(guarded.sessionId, first.sessionId)
+
+  // A forced re-run opens a NEW session and a NEW execution record.
+  const reran = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id, { force: true }))
+  assert.notEqual(reran.sessionId, first.sessionId)
+  assert.equal(ctx.agents.entries.length, 2)
+  assert.equal(reran.executions.length, 2)
+})
+
+test('settling an execution records the outcome and can land failed', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Do the thing', status: 'todo' }, human)
+
+  const opened = await board.openExecution(task.id, 'sess-1', { actor: human, status: 'in_progress' })
+  assert.equal(opened.executions.length, 1)
+  assert.equal(opened.executions[0].result, undefined)
+
+  const succeeded = await board.settleExecution(task.id, 'succeeded', { actor: human })
+  assert.equal(succeeded.executions[0].result, 'succeeded')
+  assert.ok(succeeded.executions[0].endedAt !== undefined)
+  assert.equal(succeeded.status, 'in_progress', 'success leaves the status to the agent/skill')
+
+  // A second open + failed settle lands the issue in the failed column.
+  const reopened = await board.openExecution(task.id, 'sess-2', { actor: human })
+  const failed = await board.settleExecution(task.id, 'failed', {
+    actor: human,
+    error: 'the model blew up',
+    status: 'failed',
+  })
+  assert.equal(reopened.executions.length, 2)
+  assert.equal(failed.executions.length, 2)
+  assert.equal(failed.executions[1].result, 'failed')
+  assert.equal(failed.executions[1].error, 'the model blew up')
+  assert.equal(failed.status, 'failed')
+})
+
+test('settling a settled execution is a no-op', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Do the thing' }, human)
+  await board.openExecution(task.id, 'sess-1', { actor: human, status: 'in_progress' })
+  const done = await board.settleExecution(task.id, 'succeeded', { actor: human })
+  const again = await board.settleExecution(task.id, 'failed', { actor: human })
+  assert.equal(again.executions[0].result, 'succeeded', 'a late settle cannot flip a settled result')
+  assert.equal(done.version, again.version, 'a no-op settle does not bump the version')
+})
+
+// ── schedule ──────────────────────────────────────────────────────────────────
+
+test('enabling a schedule computes the next run; disabling clears it', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Daily' }, human)
+  const from = Date.parse('2026-01-01T00:00:00.000Z')
+
+  const armed = await board.updateScheduleRule(task.id, { enabled: true, cron: '0 9 * * *' }, { actor: human }, from)
+  assert.equal(armed.schedule.enabled, true)
+  assert.equal(armed.schedule.cron, '0 9 * * *')
+  assert.equal(armed.schedule.nextRunAt, nextRunAtMs('0 9 * * *', from))
+  assert.equal(armed.schedule.lastTriggeredAt, undefined)
+
+  // Disabling clears the due instant so a stale one can never linger.
+  const disarmed = await board.updateScheduleRule(task.id, { enabled: false }, { actor: human }, from)
+  assert.equal(disarmed.schedule.enabled, false)
+  assert.equal(disarmed.schedule.nextRunAt, undefined)
+})
+
+test('an invalid schedule expression is refused', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Daily' }, human)
+
+  await assert.rejects(
+    () => board.updateScheduleRule(task.id, { enabled: true, cron: 'not a cron' }, { actor: human }),
+    err => err instanceof TaskboardError && err.code === 'invalid-input',
+  )
+  assert.equal(board.getTask(task.id).schedule, undefined, 'a rejected rule leaves the task untouched')
+})
+
+test('the scheduler runs a due issue for real and rolls the rule forward', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Scheduled', status: 'todo' }, human)
+
+  // Arm with a minute-aligned rule and force nextRunAt into the past.
+  const now = Date.now()
+  const due = nextRunAtMs('* * * * *', now - 60_000)
+  await board.updateScheduleRule(task.id, { enabled: true, cron: '* * * * *' }, { actor: human }, now)
+  await board.rollSchedule(task.id, due, now - 60_000)
+
+  const scheduler = schedulerFixture(ctx, { autoPull: false })
+  await scheduler.tick()
+
+  const stored = board.getTask(task.id)
+  assert.equal(stored.status, 'in_progress', 'the due issue was executed')
+  assert.equal(stored.executions.length, 1)
+  assert.ok(stored.schedule.lastTriggeredAt !== undefined, 'the trigger instant is recorded')
+  assert.ok(stored.schedule.nextRunAt > due, 'the rule rolled forward past the due minute')
+})
+
+test('an issue already executing at its due instant skips the run', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Scheduled' }, human)
+  await board.openExecution(task.id, 'sess-1', { actor: human, status: 'in_progress' })
+
+  // Arm "every minute" from two minutes ago, so the computed next run is
+  // already in the past when the tick reads the wall clock — deterministically
+  // due, without touching lastTriggeredAt.
+  await board.updateScheduleRule(task.id, { enabled: true, cron: '* * * * *' }, { actor: human }, Date.now() - 120_000)
+  const busy = board.getTask(task.id)
+  assert.ok(busy.schedule.nextRunAt < Date.now(), 'the rule is staged due')
+
+  const scheduler = schedulerFixture(ctx, { autoPull: false })
+  await scheduler.tick()
+
+  const stored = board.getTask(task.id)
+  assert.equal(stored.executions.length, 1, 'no second execution while the issue is already running')
+  assert.ok(stored.schedule.nextRunAt > Date.now() - 120_000, 'the rule rolled forward, skipping this occurrence')
+  assert.equal(stored.schedule.lastTriggeredAt, undefined, 'a skipped run never records a trigger')
+})
+
+test('mount reconciliation fails an orphaned in_progress issue', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const task = await board.createTask({ projectId: 'p1', title: 'Vanished' }, human)
+  await board.openExecution(task.id, 'dead-session', { actor: human, status: 'in_progress' })
+
+  await reconcileOrphans(ctx, board)
+
+  const stored = board.getTask(task.id)
+  assert.equal(stored.status, 'failed')
+  assert.equal(stored.executions[0].result, 'failed')
+  assert.match(stored.executions[0].error, /no longer exists/)
+})
+
+test('reconciliation leaves a live session and plan-claimed issues alone', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const live = await board.createTask({ projectId: 'p1', title: 'Live', status: 'todo' }, human)
+  await fromRestrictedFiber(ctx, child => startTask(child, board, live.id))
+  const claimed = await board.createTask({ projectId: 'p1', title: 'Claimed', status: 'in_progress' }, human)
+
+  await reconcileOrphans(ctx, board)
+
+  assert.equal(board.getTask(live.id).status, 'in_progress', 'a live session stays in progress')
+  assert.equal(board.getTask(claimed.id).status, 'in_progress', 'a session-less claim is not an orphan')
+  assert.equal(board.getTask(claimed.id).executions.length, 0)
 })

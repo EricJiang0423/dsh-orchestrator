@@ -35,5 +35,5 @@ export function apply(ctx: ClientContext): void {
     id: VIEW_ID,
     order: 20,
     label: () => 'Taskboard',
-  }, BoardView))
+  }, props => <BoardView {...props} openSession={id => ctx.sessions.open(id as Parameters<typeof ctx.sessions.open>[0])} />))
 }

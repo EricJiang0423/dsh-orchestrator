@@ -70,9 +70,33 @@ const CSS = `
 .tb-card-title:hover { color: var(--dsw-alias-brand-primary); }
 .tb-priority { color: var(--dsw-alias-state-warn-primary); margin-right: 4px; }
 
+/* Card meta line: runs, schedule badge, relative time. */
+.tb-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.tb-runs[data-result="failed"] { color: var(--dsw-alias-state-error-primary); }
+.tb-runs[data-result="succeeded"] { color: var(--dsw-alias-state-success-primary); }
+.tb-sched-badge {
+  padding: 1px 6px; border-radius: 999px;
+  color: var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+}
+.tb-session-chip {
+  align-self: flex-start; font-size: 11px; padding: 1px 6px; cursor: pointer;
+  color: var(--dsw-alias-brand-primary); background: none;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 999px;
+}
+.tb-session-chip:hover { border-color: var(--dsw-alias-brand-primary); }
+
+/* Board header search box. */
+.tb-search {
+  flex: 0 1 220px; min-width: 140px; padding: 3px 8px; font-size: 12px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 6px;
+}
+
 .tb-decide { display: flex; align-items: center; gap: 6px; }
 .tb-proposer { font-size: 11px; color: var(--dsw-alias-label-secondary); }
-.tb-bound { font-size: 11px; color: var(--dsw-alias-brand-primary); }
 .tb-reason {
   flex: 1; min-width: 120px; padding: 3px 6px; font-size: 12px;
   color: var(--dsw-alias-label-primary);
@@ -83,6 +107,29 @@ const CSS = `
 .tb-comment { border-left: 2px solid var(--dsw-alias-border-l2); padding-left: 8px; }
 .tb-comment-author { color: var(--dsw-alias-label-secondary); }
 .tb-activity { margin: 0; padding-left: 16px; color: var(--dsw-alias-label-secondary); }
+
+/* Execution history and schedule editor inside the expanded card. */
+.tb-executions { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.tb-executions li { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tb-exec-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  color: var(--dsw-alias-label-secondary); border: 1px solid var(--dsw-alias-border-l1);
+}
+.tb-exec-badge[data-result="failed"] { color: var(--dsw-alias-state-error-primary); border-color: var(--dsw-alias-state-error-primary); }
+.tb-exec-badge[data-result="succeeded"] { color: var(--dsw-alias-state-success-primary); border-color: var(--dsw-alias-state-success-primary); }
+.tb-exec-times { color: var(--dsw-alias-label-secondary); }
+.tb-exec-error { color: var(--dsw-alias-state-error-primary); font-size: 11px; }
+.tb-link {
+  font-size: 11px; background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--dsw-alias-brand-primary);
+}
+.tb-schedule { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.tb-schedule-toggle { display: flex; align-items: center; gap: 4px; color: var(--dsw-alias-label-secondary); }
+.tb-cron { flex: 0 1 110px; min-width: 90px; }
+.tb-preset {
+  font-size: 11px; padding: 2px 4px; color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l1); border-radius: 6px;
+}
 .tb-empty { font-size: 13px; color: var(--dsw-alias-label-secondary); }
 `
 

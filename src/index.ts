@@ -12,16 +12,20 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 // Side-effect type import: merges `webServer` onto Context.
 import type {} from '@deepseek-ai/dsh-host-webserver'
+// Side-effect type import: merges `systemPrompt` onto Context.
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import { applyCommand } from './command.ts'
 import { applyPlanLoop, type PlanLoopConfig } from './plan-loop.ts'
 import { applyRpc } from './rpc.ts'
-import { applySessionLink, type SchedulerConfig } from './session-link.ts'
+import { applySessionLink } from './session-link.ts'
+import type { SchedulerConfig } from './wire.ts'
 import { applyTools } from './tools.ts'
 import { Taskboard } from './service.ts'
 import { applySkill } from './skill.ts'
 
 export * from './domain.ts'
 export * from './wire.ts'
+export { isValidCron, nextRunAtMs, parseCron } from './schedule.ts'
 export { LOCAL_USER, agentActor } from './actors.ts'
 export { Taskboard, TaskboardError } from './service.ts'
 export type { CreateTaskInput, TaskFilter, TaskboardErrorCode, UpdateTaskPatch } from './service.ts'
@@ -75,6 +79,24 @@ export function apply(ctx: Context, config: Config): void {
 
   // The board's working agreement, wherever a skill registry exists.
   ctx.inject(['skills'], applySkill)
+
+  // Announce the board to every agent, wherever a system-prompt registry exists.
+  // A concise pointer, not the skill body: the skill carries the how; this tells
+  // the model it is working inside a board so it checks before assuming otherwise.
+  ctx.inject(['systemPrompt'], promptCtx => {
+    promptCtx.effect(() => promptCtx.systemPrompt.section({
+      name: 'plugin:taskboard',
+      order: 200,
+      text: [
+        'This deployment includes dsh-orchestrator, a local task board.',
+        'Issues on it have an id and a status; an agent works an issue by claiming it',
+        '(taskboard_update to in_progress), commenting as it goes (taskboard_comment),',
+        'and handing it back in_review — never done, which only a human can accept.',
+        'New work is proposed (taskboard_propose), not started. When the user refers',
+        'to "the board" or an issue, use the taskboard_* tools.',
+      ].join(' '),
+    }), 'taskboard: guidance')
+  })
 
   // Human-facing face: present wherever a command adapter is.
   ctx.inject(['commands', 'taskboard'], applyCommand)
