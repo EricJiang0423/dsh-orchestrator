@@ -21,11 +21,20 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsRuntime, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ExecutionRecord, Project, SessionMessage, Task, TaskStatus } from '../domain.ts'
+import type {
+  AgentProfile,
+  ExecutionRecord,
+  Project,
+  SessionMessage,
+  Task,
+  TaskStatus,
+} from '../domain.ts'
 import { isValidCron } from '../schedule.ts'
 import type { SchedulerState, TaskDetail } from '../wire.ts'
 import { CreateProjectModal, takeNewProjectHint } from './create-project.tsx'
+import { CreateTaskModal } from './create-task.tsx'
 import { RpcError, call, subscribe } from './rpc.ts'
+import { openTaskHubView, takeNewTaskRequest, useTaskHubNavigation } from './task-hub-navigation.ts'
 
 /**
  * Columns, left to right.
@@ -105,7 +114,9 @@ function matchesFilter(task: Task, filter: string): boolean {
 /** Fields the card's inline editors may change — the user-facing slice of the
  *  host's update patch, declared here so the client bundle never imports
  *  service code. */
-type CardPatch = Partial<Pick<Task, 'title' | 'description' | 'priority' | 'labels' | 'status'>>
+type CardPatch = Partial<Pick<Task, 'title' | 'description' | 'priority' | 'labels' | 'status'>> & {
+  agentProfileId?: string | null
+}
 
 /** The workspace board this session belongs to, with live scheduler state. */
 interface BoardData {
@@ -145,6 +156,7 @@ function Card({
   expanded,
   detail,
   messages,
+  agents,
   onToggle,
   onDecide,
   onStart,
@@ -161,6 +173,7 @@ function Card({
   dragging,
   onDragBegin,
   onDragEnd,
+  onDropStatus,
   openSession,
 }: {
   task: Task
@@ -168,6 +181,8 @@ function Card({
   detail: TaskDetail | undefined
   /** Board-wide session mail; this card keeps the slice that touches it. */
   messages: SessionMessage[]
+  /** User-created agents available on this task's board. */
+  agents: AgentProfile[]
   onToggle: () => void
   onDecide: (task: Task, approve: boolean) => void
   onStart: (task: Task) => void
@@ -185,6 +200,7 @@ function Card({
   dragging: boolean
   onDragBegin: (id: string) => void
   onDragEnd: () => void
+  onDropStatus: (id: string, status: TaskStatus) => void
   openSession: (id: string) => void
 }) {
   // Session mail this issue is involved in, by id or by bound session.
@@ -225,6 +241,21 @@ function Card({
   const [descDraft, setDescDraft] = useState(task.description)
   const [labelDraft, setLabelDraft] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
+  const pointerDragRef = useRef<
+    | {
+        pointerId: number
+        startX: number
+        startY: number
+        active: boolean
+        openOnRelease: boolean
+      }
+    | undefined
+  >(undefined)
+  const clearDropHighlights = (): void => {
+    for (const column of document.querySelectorAll('.tb-column-over')) {
+      column.classList.remove('tb-column-over')
+    }
+  }
   // Escape/Cancel set this so the blur that follows an unmount never commits
   // the abandoned draft: blur is the title input's ONLY commit path, and a
   // cancel must survive until that blur fires.
@@ -303,6 +334,60 @@ function Card({
       ref={rootRef}
       data-expanded={expanded ? 'true' : undefined}
       data-dragging={dragging ? 'true' : undefined}
+      onPointerDown={event => {
+        if (expanded || editingTitle || event.button !== 0) return
+        const target = event.target as HTMLElement
+        if (target.closest('input, textarea, select, button:not(.tb-card-title)') !== null) {
+          return
+        }
+        pointerDragRef.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          active: false,
+          openOnRelease: target.closest('.tb-card-title') !== null,
+        }
+        event.currentTarget.setPointerCapture(event.pointerId)
+      }}
+      onPointerMove={event => {
+        const gesture = pointerDragRef.current
+        if (gesture === undefined || gesture.pointerId !== event.pointerId) return
+        if (gesture.active) {
+          clearDropHighlights()
+          document
+            .elementFromPoint(event.clientX, event.clientY)
+            ?.closest<HTMLElement>('.tb-column')
+            ?.classList.add('tb-column-over')
+          return
+        }
+        if (Math.abs(event.clientX - gesture.startX) + Math.abs(event.clientY - gesture.startY) < 8)
+          return
+        gesture.active = true
+        onDragBegin(task.id)
+      }}
+      onPointerUp={event => {
+        const gesture = pointerDragRef.current
+        if (gesture === undefined || gesture.pointerId !== event.pointerId) return
+        pointerDragRef.current = undefined
+        event.currentTarget.releasePointerCapture(event.pointerId)
+        if (!gesture.active) {
+          if (gesture.openOnRelease) onToggle()
+          return
+        }
+        const target = document.elementFromPoint(event.clientX, event.clientY)
+        const column = target?.closest<HTMLElement>('.tb-column')
+        const status = column?.dataset.status
+        if (status !== undefined && COLUMNS.includes(status as TaskStatus)) {
+          onDropStatus(task.id, status as TaskStatus)
+        }
+        clearDropHighlights()
+        onDragEnd()
+      }}
+      onPointerCancel={() => {
+        pointerDragRef.current = undefined
+        clearDropHighlights()
+        onDragEnd()
+      }}
     >
       {editingTitle ? (
         <div className="tb-card-head">
@@ -337,28 +422,18 @@ function Card({
           <button
             type="button"
             className="tb-card-title"
-            draggable
-            onClick={onToggle}
+            onClick={event => {
+              // Pointer activation is handled by the card's pointer-up so it
+              // can distinguish a click from a drag. Keyboard activation has
+              // detail 0 and still opens the document here.
+              if (event.detail === 0) onToggle()
+            }}
             onDoubleClick={() => {
               cancelTitleRef.current = false
               setTitleDraft(task.title)
               setEditingTitle(true)
             }}
-            onDragStart={event => {
-              event.dataTransfer.setData('text/plain', task.id)
-              event.dataTransfer.effectAllowed = 'move'
-              if (rootRef.current !== null) {
-                const rect = rootRef.current.getBoundingClientRect()
-                event.dataTransfer.setDragImage(
-                  rootRef.current,
-                  event.clientX - rect.left,
-                  event.clientY - rect.top,
-                )
-              }
-              onDragBegin(task.id)
-            }}
-            onDragEnd={onDragEnd}
-            title="Click to expand · drag to move"
+            title="打开任务详情 · 拖拽卡片可移动状态"
           >
             {PRIORITY_MARK[task.priority] !== undefined && (
               <span className="tb-priority" aria-label={`priority ${task.priority}`}>
@@ -438,6 +513,13 @@ function Card({
             title={msgs.length === 1 ? '1 session message' : `${msgs.length} session messages`}
           >
             💬 {msgs.length}
+          </span>
+        )}
+        {task.agentProfileId !== undefined && (
+          <span className="tb-agent-chip">
+            {agents.find(agent => agent.id === task.agentProfileId)?.name ??
+              task.assignee?.name ??
+              '智能体'}
           </span>
         )}
         <span className="tb-time">updated {formatTime(Date.parse(task.updatedAt))}</span>
@@ -599,6 +681,26 @@ function Card({
           {/* Priority + labels: both patch through the same version-checked
               update as every other inline edit. */}
           <div className="tb-fields">
+            <label className="tb-field">
+              <span className="tb-field-label">智能体</span>
+              <select
+                className="tb-preset"
+                value={task.agentProfileId ?? ''}
+                aria-label="assigned agent"
+                onChange={event => {
+                  onEdit(task, {
+                    agentProfileId: event.target.value === '' ? null : event.target.value,
+                  })
+                }}
+              >
+                <option value="">未分配</option>
+                {agents.map(agent => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            </label>
             <label className="tb-field">
               <span className="tb-field-label">Priority</span>
               <select
@@ -887,6 +989,7 @@ export function BoardView({
   openSession: (id: string) => void
   t: TranslateNS<'taskboard'>
 }) {
+  const navigation = useTaskHubNavigation()
   const [view, setView] = useState<BoardData | undefined>(undefined)
   // Project pills carry each board's live issue count, so the boards that hold
   // the issues stay visible even when the board being viewed is empty.
@@ -895,6 +998,7 @@ export function BoardView({
   const [projectId, setProjectId] = useState<string | undefined>(undefined)
   const [tasks, setTasks] = useState<Task[]>([])
   const [messages, setMessages] = useState<SessionMessage[]>([])
+  const [agents, setAgents] = useState<AgentProfile[]>([])
   const [openId, setOpenId] = useState<string | undefined>(undefined)
   const [detail, setDetail] = useState<TaskDetail | undefined>(undefined)
   const [error, setError] = useState<string | undefined>(undefined)
@@ -905,8 +1009,17 @@ export function BoardView({
   const [frames, setFrames] = useState(0)
   /** Whether the "new taskboard" form is open. */
   const [creating, setCreating] = useState(false)
+  const [creatingTask, setCreatingTask] = useState(false)
+  const [commentDraft, setCommentDraft] = useState('')
   /** Task id currently being dragged; undefined = no drag in flight. */
   const [draggingId, setDraggingId] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    if (takeNewTaskRequest()) setCreatingTask(true)
+  }, [navigation.createTaskToken])
+
+  useEffect(() => {
+    if (navigation.taskId !== undefined) setOpenId(navigation.taskId)
+  }, [navigation.taskId])
 
   // A board created from the sidebar may land before this view mounts; the
   // hint it left makes the new project the visible one on first paint.
@@ -974,6 +1087,8 @@ export function BoardView({
           : await call('message.list', { projectId }).catch(() => []),
       )
       const listed = await call('project.list', {})
+      const activeProjectId = projectId ?? loaded.project.id
+      setAgents(await call('agent.list', { projectId: activeProjectId }))
       setProjects(
         await Promise.all(
           listed.map(async project => ({
@@ -1332,9 +1447,187 @@ export function BoardView({
     [openId],
   )
 
+  const addComment = useCallback(
+    async (task: Task) => {
+      const body = commentDraft.trim()
+      if (body === '') return
+      try {
+        await call('comment.create', { taskId: task.id, body })
+        setCommentDraft('')
+        await refresh()
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause))
+      }
+    },
+    [commentDraft, refresh],
+  )
+
+  const activeProject =
+    projectId === undefined ? view?.project : projects.find(row => row.id === projectId)
+  const selectedTask = openId === undefined ? undefined : tasks.find(task => task.id === openId)
+
+  if (selectedTask !== undefined) {
+    return (
+      <div className="tb-hub-page tb-task-page">
+        <header className="tb-page-head">
+          <button
+            type="button"
+            className="tb-back"
+            onClick={() => {
+              setOpenId(undefined)
+              openTaskHubView('tasks')
+            }}
+          >
+            ← 任务
+          </button>
+          <span className="tb-page-actions">
+            {selectedTask.sessionId !== undefined && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => openSession(selectedTask.sessionId!)}
+              >
+                打开会话
+              </Button>
+            )}
+            {selectedTask.status === 'in_review' && (
+              <Button size="sm" variant="primary" onClick={() => void accept(selectedTask)}>
+                接受结果
+              </Button>
+            )}
+          </span>
+        </header>
+        {error !== undefined && <div className="tb-error">{error}</div>}
+        <div className="tb-task-document">
+          <main className="tb-task-main">
+            <MemoCard
+              task={selectedTask}
+              messages={messages}
+              agents={agents}
+              expanded
+              detail={detail}
+              onToggle={() => {}}
+              onDecide={(target, approve) => void decide(target, approve)}
+              onStart={target => void start(target)}
+              onRerun={target => void rerun(target)}
+              onAccept={target => void accept(target)}
+              onSendBack={(target, reason) => void sendBack(target, reason)}
+              onArchive={target => void archive(target)}
+              onRestore={target => void restore(target)}
+              onDelete={target => void remove(target)}
+              onSetSchedule={(target, patch) => void setSchedule(target, patch)}
+              onEdit={(target, patch) => void editTask(target, patch)}
+              otherProjects={projects.filter(project => project.id !== selectedTask.projectId)}
+              onMove={(target, targetProjectId) => void moveToBoard(target, targetProjectId)}
+              dragging={false}
+              onDragBegin={() => {}}
+              onDragEnd={() => {}}
+              onDropStatus={() => {}}
+              openSession={openSession}
+            />
+            <section className="tb-comment-composer">
+              <textarea
+                rows={4}
+                value={commentDraft}
+                placeholder="留下评论或审核说明…"
+                onChange={event => setCommentDraft(event.target.value)}
+                onKeyDown={event => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter')
+                    void addComment(selectedTask)
+                }}
+              />
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={commentDraft.trim() === ''}
+                onClick={() => void addComment(selectedTask)}
+              >
+                发表评论
+              </Button>
+            </section>
+          </main>
+          <aside className="tb-task-inspector">
+            <h2>任务属性</h2>
+            <label>
+              <span>状态</span>
+              <select
+                value={selectedTask.status}
+                onChange={event => void moveTask(selectedTask.id, event.target.value as TaskStatus)}
+              >
+                {COLUMNS.map(status => (
+                  <option key={status} value={status}>
+                    {COLUMN_LABEL[status]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>智能体</span>
+              <select
+                value={selectedTask.agentProfileId ?? ''}
+                onChange={event =>
+                  void editTask(selectedTask, {
+                    agentProfileId: event.target.value === '' ? null : event.target.value,
+                  })
+                }
+              >
+                <option value="">未分配</option>
+                {agents.map(agent => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>优先级</span>
+              <select
+                value={selectedTask.priority}
+                onChange={event =>
+                  void editTask(selectedTask, { priority: event.target.value as Task['priority'] })
+                }
+              >
+                <option value="none">无</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+                <option value="urgent">紧急</option>
+              </select>
+            </label>
+            <dl>
+              <dt>项目</dt>
+              <dd>{activeProject?.name ?? selectedTask.projectId}</dd>
+              <dt>任务编号</dt>
+              <dd>{selectedTask.id.slice(0, 8)}</dd>
+              <dt>创建时间</dt>
+              <dd>{new Date(selectedTask.createdAt).toLocaleString()}</dd>
+              <dt>更新时间</dt>
+              <dd>{new Date(selectedTask.updatedAt).toLocaleString()}</dd>
+              <dt>运行次数</dt>
+              <dd>{selectedTask.executions.length}</dd>
+            </dl>
+          </aside>
+        </div>
+        <CreateTaskModal
+          open={creatingTask}
+          project={activeProject}
+          agents={agents}
+          onClose={() => setCreatingTask(false)}
+          onCreated={task => {
+            setOpenId(task.id)
+            void refresh()
+          }}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="tb-root">
       <div className="tb-bar">
+        <Button size="sm" variant="primary" onClick={() => setCreatingTask(true)}>
+          ＋ 新建任务
+        </Button>
         {view !== undefined && (
           <Pill
             active={projectId === undefined}
@@ -1493,6 +1786,7 @@ export function BoardView({
                   key={task.id}
                   task={task}
                   messages={messages}
+                  agents={agents}
                   expanded={openId === task.id}
                   detail={openId === task.id ? detail : undefined}
                   onToggle={() => {
@@ -1536,6 +1830,9 @@ export function BoardView({
                   onDragBegin={setDraggingId}
                   onDragEnd={() => {
                     setDraggingId(undefined)
+                  }}
+                  onDropStatus={(id, status) => {
+                    void moveTask(id, status)
                   }}
                   openSession={openSession}
                 />
@@ -1589,6 +1886,16 @@ export function BoardView({
           setCreating(false)
         }}
         t={t}
+      />
+      <CreateTaskModal
+        open={creatingTask}
+        project={activeProject}
+        agents={agents}
+        onClose={() => setCreatingTask(false)}
+        onCreated={task => {
+          setOpenId(task.id)
+          void refresh()
+        }}
       />
     </div>
   )

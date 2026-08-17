@@ -22,6 +22,7 @@ import {
   EVENTS_ROUTE,
   RPC_ROUTE,
   TASKBOARD_METHODS,
+  type AgentRuntimeOption,
   type ParamsOf,
   type TaskboardChange,
   type TaskboardMethod,
@@ -101,16 +102,23 @@ async function dispatch(
       return board.addComment(taskId, body, LOCAL_USER)
     }
     case 'task.start': {
-      const { id, sessionId } = p as unknown as ParamsOf<'task.start'>
+      const { id, sessionId, agentProfileId } = p as unknown as ParamsOf<'task.start'>
       const cwd = sessionCwd(ctx, sessionId)
-      return startTask(ctx, board, id, cwd !== undefined ? { cwd } : {})
+      return startTask(ctx, board, id, {
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(agentProfileId !== undefined ? { agentProfileId } : {}),
+      })
     }
     case 'task.rerun': {
       // Re-run of a settled/finished issue: startTask's live-session guard would
       // return the stale idle session, so force a fresh one.
-      const { id, sessionId } = p as unknown as ParamsOf<'task.rerun'>
+      const { id, sessionId, agentProfileId } = p as unknown as ParamsOf<'task.rerun'>
       const cwd = sessionCwd(ctx, sessionId)
-      return startTask(ctx, board, id, cwd !== undefined ? { force: true, cwd } : { force: true })
+      return startTask(ctx, board, id, {
+        force: true,
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(agentProfileId !== undefined ? { agentProfileId } : {}),
+      })
     }
     case 'task.schedule': {
       const { id, patch, expectedVersion } = p as unknown as ParamsOf<'task.schedule'>
@@ -204,6 +212,37 @@ async function dispatch(
         ...(toSessionId !== undefined ? { toSessionId } : {}),
         body,
       })
+    }
+    case 'agent.list': {
+      const { projectId, includeArchived } = p as unknown as ParamsOf<'agent.list'>
+      return board.listAgentProfiles(projectId, includeArchived)
+    }
+    case 'agent.runtime.list': {
+      const presets = ctx.reflect.get('agentPresets', false)
+      if (presets === undefined) return []
+      return (await presets.list()).map((preset: AgentRuntimeOption) => ({
+        id: preset.id,
+        name: preset.name ?? preset.id,
+        ...(preset.broken !== undefined ? { broken: preset.broken } : {}),
+      }))
+    }
+    case 'agent.create':
+      return board.createAgentProfile(p as unknown as ParamsOf<'agent.create'>)
+    case 'agent.update': {
+      const { id, patch, expectedVersion } = p as unknown as ParamsOf<'agent.update'>
+      return board.updateAgentProfile(id, patch, expectedVersion)
+    }
+    case 'agent.archive': {
+      const { id, archived, expectedVersion } = p as unknown as ParamsOf<'agent.archive'>
+      return board.setAgentProfileArchived(id, archived, expectedVersion)
+    }
+    case 'inbox.list': {
+      const { projectId } = p as unknown as ParamsOf<'inbox.list'>
+      return board.listInbox(projectId)
+    }
+    case 'inbox.update': {
+      const { projectId, id, patch } = p as unknown as ParamsOf<'inbox.update'>
+      return board.updateInboxItem(projectId, id, patch)
     }
   }
 }

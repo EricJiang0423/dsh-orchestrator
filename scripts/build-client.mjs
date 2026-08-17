@@ -25,7 +25,7 @@ const { name: packageName } = JSON.parse(await readFile(join(root, 'package.json
 const patch = await readFile(join(root, 'cordis.patch.yml'), 'utf8')
 // The `taskboard` row's mounted name; falls back to the package name when the
 // patch file does not carry a row in the expected shape.
-const id = patch.match(/- id:\s*taskboard\s*\n\s*name:\s*(\S+)/)?.[1] ?? packageName
+const id = patch.match(/- id:\s*taskboard\s*\n\s*name:\s*['"]?([^'"\s]+)['"]?/)?.[1] ?? packageName
 const outputPath = join(root, 'lib', 'client.js')
 
 // React and every dsh client package come from the host's module table.

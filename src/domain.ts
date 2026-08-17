@@ -1,6 +1,6 @@
 /**
- * Board data model: one storage domain with six tables (projects, tasks,
- * comments, activities, session messages, settings).
+ * Board data model: one storage domain with eight tables (projects, tasks,
+ * comments, activities, session messages, settings, agents, inbox receipts).
  *
  * Ported from dashi-taskboard's `shared/domain.mjs` and its hand-written SQLite
  * schema (40+ ALTER statements) onto `ctx.storageDomain`, which validates every
@@ -20,6 +20,8 @@ export type CommentId = string & { readonly __brand: 'CommentId' }
 export type ActivityId = string & { readonly __brand: 'ActivityId' }
 export type MessageId = string & { readonly __brand: 'MessageId' }
 export type SettingsKey = string & { readonly __brand: 'SettingsKey' }
+export type AgentProfileId = string & { readonly __brand: 'AgentProfileId' }
+export type InboxReceiptId = string & { readonly __brand: 'InboxReceiptId' }
 
 /** The one settings record key: the scheduler's durable knobs. */
 export const SCHEDULER_SETTINGS_KEY = 'scheduler' as SettingsKey
@@ -70,6 +72,10 @@ export interface ExecutionRecord {
   endedAt?: number
   /** How it settled, once the turn stopped or failed. */
   result?: ExecutionResult
+  /** Durable user-created agent identity selected for this attempt. */
+  agentProfileId?: string
+  /** Agent display name captured at launch so history survives later edits. */
+  agentName?: string
   /** Human-readable failure text, carried only for failed runs. */
   error?: string
 }
@@ -116,6 +122,8 @@ const executionRecordSchema = z.object({
   startedAt: z.number(),
   endedAt: z.number().optional(),
   result: z.enum(EXECUTION_RESULTS).optional(),
+  agentProfileId: z.string().optional(),
+  agentName: z.string().optional(),
   error: z.string().optional(),
 })
 
@@ -154,6 +162,8 @@ const taskSchema = z.object({
   priority: z.enum(TASK_PRIORITIES).default('none'),
   labels: z.array(z.string()).default([]),
   assignee: actorSchema.optional(),
+  /** User-created agent selected to own the next and latest execution. */
+  agentProfileId: z.string().optional(),
   creator: actorSchema,
   /** Lexical rank within a column; ties break on id. */
   sortKey: z.string(),
@@ -248,10 +258,33 @@ const sessionMessageSchema = z.object({
 /** One inter-session agent message. */
 export type SessionMessage = z.infer<typeof sessionMessageSchema>
 
-/** The board's storage domain: six tables under one write chain. */
+const agentProfileSchema = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  name: z.string(),
+  description: z.string().default(''),
+  instructions: z.string().default(''),
+  presetId: z.string(),
+  version: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  archivedAt: z.string().optional(),
+})
+/** Durable user-created agent identity and its Harness execution configuration. */
+export type AgentProfile = z.infer<typeof agentProfileSchema>
+
+const inboxReceiptSchema = z.object({
+  id: z.string(),
+  readAt: z.string().optional(),
+  archivedAt: z.string().optional(),
+})
+/** Per-event read and archive state; event content is derived from durable work records. */
+export type InboxReceipt = z.infer<typeof inboxReceiptSchema>
+
+/** The board's storage domain: work records plus agent profiles and inbox state. */
 export const taskboardDomain = defineDomain({
   name: 'taskboard',
-  version: 1,
+  version: 2,
   tables: {
     projects: domainTable<ProjectId, Project>(projectSchema),
     tasks: domainTable<TaskId, Task>(taskSchema),
@@ -259,6 +292,8 @@ export const taskboardDomain = defineDomain({
     activities: domainTable<ActivityId, Activity>(activitySchema),
     messages: domainTable<MessageId, SessionMessage>(sessionMessageSchema),
     settings: domainTable<SettingsKey, SchedulerSettings>(schedulerSettingsSchema),
+    agents: domainTable<AgentProfileId, AgentProfile>(agentProfileSchema),
+    inbox_receipts: domainTable<InboxReceiptId, InboxReceipt>(inboxReceiptSchema),
   },
 })
 

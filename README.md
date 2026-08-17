@@ -39,6 +39,9 @@ English · [中文](README-zh.md)
 | Three Human Gates        | An agent can never move an issue out of `proposed`, can never mark one `done`, and can never shelve one as `archieved`: proposals need your approval, finished work needs your acceptance, and archiving accepted work is yours too — all enforced in the service layer, not the UI |
 | Durable Approval Queue   | Agent-proposed issues land in a `proposed` column and stay there until a human approves or rejects them — durable across restarts, unlike a one-shot approval prompt                                                                                                                |
 | Board as a Chat Peer     | The board registers into the conversation view ring, so it appears as a tab beside Chat and Trajectory instead of a separate page                                                                                                                                                   |
+| Task Hub Sidebar         | Persistent Tasks, Inbox, and Agents entries open one workspace-native hub; task cards drag between status columns and open as full documents with a property inspector                                                                                                              |
+| User-Created Agents      | Users create durable agent identities with a name, responsibility, standing instructions, and a Harness Agent Preset; assignments and execution history retain that identity instead of treating the preset as the agent                                                            |
+| Human Inbox              | Proposals, completed work awaiting review, failed executions, and cross-agent mail arrive in one read/archive queue with task, review, and session actions                                                                                                                          |
 
 ---
 
@@ -145,7 +148,7 @@ const res = await fetch('/_dsh/taskboard/rpc', {
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%
 graph LR
-    UI[Board View<br/>React] -->|RPC + SSE| SVC[Taskboard Service<br/>Cordis Plugin]
+    UI[Task Hub<br/>Tasks · Inbox · Agents] -->|RPC + SSE| SVC[Taskboard Service<br/>Cordis Plugin]
     TOOLS[taskboard_* Tools<br/>Model-facing] --> SVC
     PLAN[taskboard_plan<br/>Workflow Engine] -->|fresh subagents| TOOLS
     SVC --> DB[(Storage Domain)]
@@ -200,6 +203,8 @@ The browser half talks to the host half over one endpoint, `POST /_dsh/taskboard
 | `task.accept`         | Accept finished work (`in_review` → `done`) — the human gate no agent can pass                 |
 | `task.sendBack`       | Send finished work back to `todo` with a reason (recorded as a comment), unbinding its session |
 | `scheduler.configure` | Change concurrency or the auto-pull toggle; returns the resulting state                        |
+| `agent.*`             | List, create, edit, archive, and restore user-created agents and list Harness runtime presets  |
+| `inbox.*`             | List derived human inbox events and persist read/archive state                                 |
 
 Change notifications stream over `GET /_dsh/taskboard/events` as Server-Sent Events.
 
@@ -211,6 +216,9 @@ Change notifications stream over `GET /_dsh/taskboard/events` as Server-Sent Eve
 src/
 ├── client/              # Browser half
 │   ├── board.tsx         # BoardView: columns, cards, scheduler strip, approval + acceptance controls
+│   ├── agents.tsx         # User-created agent roster, editor, detail, runtime and recent work
+│   ├── inbox.tsx          # Event rail and actionable inbox detail
+│   ├── workspace.tsx      # Tasks / Inbox / Agents workspace router
 │   ├── index.tsx          # Client plugin entry, slot registration
 │   ├── rpc.ts              # fetch()-based RPC client + SSE subscription
 │   └── styles.ts            # Layout-only CSS; every color is a theme token

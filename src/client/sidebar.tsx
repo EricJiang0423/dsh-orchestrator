@@ -15,21 +15,24 @@
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import {
+  IconAgentPresetOutline16,
+  IconArchiveOutline20,
   IconChecklistOutline14,
-  IconProjectAddOutline16,
+  IconPlusOutline16,
   Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { useState } from 'react'
 // Side-effect type import: merges the sidebar shell's SlotMap entries.
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import type { Project } from '../domain.ts'
-import { CreateProjectModal, hintNewProject } from './create-project.tsx'
+import type { TaskHubView } from './task-hub-navigation.ts'
+import { openTaskHubView, requestNewTask, useTaskHubNavigation } from './task-hub-navigation.ts'
 import { openTaskboardView } from './view-control.ts'
 
 /** Dictionary keys of this package's client copy. */
 export type TaskboardKey =
-  | 'entry.open'
+  | 'entry.tasks'
+  | 'entry.inbox'
+  | 'entry.agents'
   | 'new.label'
   | 'new.tooltip'
   | 'project.new.title'
@@ -63,7 +66,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
  * session still lands on the fallback "Tasks" board on the host.
  * @param ctx - Client context.
  */
-export function openTaskboardFromSidebar(ctx: ClientContext): void {
+export function openTaskboardFromSidebar(ctx: ClientContext, view: TaskHubView): void {
+  openTaskHubView(view)
   const { sessions, workspaces } = ctx
   const current = sessions.list.getSnapshot().current
   if (current !== undefined) {
@@ -89,7 +93,7 @@ export function openTaskboardFromSidebar(ctx: ClientContext): void {
 /** Props of the footer entry: the shell's column state plus our injected opener. */
 export type TaskboardSidebarEntryProps = PropsRuntime<'sidebar.footer.action'> &
   PropsLocale<'taskboard'> & {
-    onOpen: () => void
+    onOpen: (view: TaskHubView) => void
   }
 
 /**
@@ -97,78 +101,76 @@ export type TaskboardSidebarEntryProps = PropsRuntime<'sidebar.footer.action'> &
  * @returns the entry element (wide row, or icon-only on the collapsed rail).
  */
 export function TaskboardSidebarEntry({ wide, t, onOpen }: TaskboardSidebarEntryProps) {
-  const button = (
-    <button type="button" className="tb-side-entry" onClick={onOpen} aria-label={t('entry.open')}>
-      <IconChecklistOutline14 size={wide ? 14 : 18} />
-      {wide && <span className="tb-side-entry-label">Taskboard</span>}
-    </button>
-  )
-  if (wide) return button
+  const navigation = useTaskHubNavigation()
+  const rows: Array<{
+    view: TaskHubView
+    key: 'entry.tasks' | 'entry.inbox' | 'entry.agents'
+    icon: typeof IconChecklistOutline14
+  }> = [
+    { view: 'tasks', key: 'entry.tasks', icon: IconChecklistOutline14 },
+    { view: 'inbox', key: 'entry.inbox', icon: IconArchiveOutline20 },
+    { view: 'agents', key: 'entry.agents', icon: IconAgentPresetOutline16 },
+  ]
   return (
-    <Tooltip label={t('entry.open')} delayMs={500}>
-      {button}
-    </Tooltip>
+    <nav className="tb-side-nav" aria-label="Task Hub">
+      {rows.map(row => {
+        const Icon = row.icon
+        const button = (
+          <button
+            key={row.view}
+            type="button"
+            className="tb-side-entry"
+            data-active={navigation.view === row.view ? 'true' : undefined}
+            onClick={() => onOpen(row.view)}
+            aria-label={t(row.key)}
+          >
+            <Icon size={wide ? 14 : 18} />
+            {wide && <span className="tb-side-entry-label">{t(row.key)}</span>}
+          </button>
+        )
+        return wide ? (
+          button
+        ) : (
+          <Tooltip key={row.view} label={t(row.key)} delayMs={500}>
+            {button}
+          </Tooltip>
+        )
+      })}
+    </nav>
   )
 }
 
 /** Props of the top entry: shell column state plus our injected callbacks. */
 export type NewTaskboardSidebarEntryProps = PropsRuntime<'sidebar.action.top'> &
   PropsLocale<'taskboard'> & {
-    /** Jump to the board after a project was created. */
     onOpen: () => void
-    /** The project that was just created. */
-    onCreated: (project: Project) => void
   }
 
 /**
  * The "New taskboard" button rendered below the New Session button.
  * @returns the button (wide, or icon-only on the collapsed rail) and its modal.
  */
-export function NewTaskboardSidebarEntry({
-  wide,
-  t,
-  onOpen,
-  onCreated,
-}: NewTaskboardSidebarEntryProps) {
-  const [creating, setCreating] = useState(false)
-
+export function NewTaskboardSidebarEntry({ wide, t, onOpen }: NewTaskboardSidebarEntryProps) {
   const button = (
     <button
       type="button"
       className={wide ? 'tb-side-new' : 'tb-side-new tb-side-new-rail'}
       onClick={() => {
-        setCreating(true)
+        requestNewTask()
+        onOpen()
       }}
       aria-label={t('new.tooltip')}
     >
-      <IconProjectAddOutline16 size={wide ? 14 : 18} />
+      <IconPlusOutline16 size={wide ? 14 : 18} />
       {wide && <span className="tb-side-new-label">{t('new.label')}</span>}
     </button>
   )
 
-  return (
-    <>
-      {wide ? (
-        button
-      ) : (
-        <Tooltip label={t('new.tooltip')} delayMs={500}>
-          {button}
-        </Tooltip>
-      )}
-      <CreateProjectModal
-        open={creating}
-        onClose={() => {
-          setCreating(false)
-        }}
-        onCreated={project => {
-          // The board view may not be mounted yet (fresh session): leave the
-          // hint it consumes on mount, then jump there.
-          hintNewProject(project.id)
-          onCreated(project)
-          onOpen()
-        }}
-        t={t}
-      />
-    </>
+  return wide ? (
+    button
+  ) : (
+    <Tooltip label={t('new.tooltip')} delayMs={500}>
+      {button}
+    </Tooltip>
   )
 }

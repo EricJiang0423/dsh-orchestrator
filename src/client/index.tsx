@@ -21,7 +21,6 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Side-effect type imports: merge slot keys and `locale` onto the client Context.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import { BoardView } from './board.tsx'
 import {
   NewTaskboardSidebarEntry,
   openTaskboardFromSidebar,
@@ -29,6 +28,7 @@ import {
   type TaskboardKey,
 } from './sidebar.tsx'
 import { installStyles } from './styles.ts'
+import { TaskHubWorkspace } from './workspace.tsx'
 
 /** Slot entry id; also the persisted active-view key. */
 const VIEW_ID = 'taskboard'
@@ -79,9 +79,11 @@ function openSessionWhenListed(ctx: ClientContext, id: string): void {
 
 /** Simplified Chinese dictionary (key-set source of truth, see sidebar.tsx). */
 const zh: Record<TaskboardKey, string> = {
-  'entry.open': '打开 Taskboard',
-  'new.label': '新建 Taskboard',
-  'new.tooltip': '新建 Taskboard',
+  'entry.tasks': '任务',
+  'entry.inbox': '收件箱',
+  'entry.agents': '智能体',
+  'new.label': '新建任务',
+  'new.tooltip': '新建任务',
   'project.new.title': '新建 Taskboard',
   'project.new.description':
     '一个 Taskboard 就是一个项目：自己的看板列和自己的问题列表。可以绑定一个项目文件夹，也可以先不绑，之后再补。',
@@ -92,9 +94,11 @@ const zh: Record<TaskboardKey, string> = {
 
 /** English dictionary, checked complete against the zh key set. */
 const en: Record<TaskboardKey, string> = {
-  'entry.open': 'Open Taskboard',
-  'new.label': 'New Taskboard',
-  'new.tooltip': 'New Taskboard',
+  'entry.tasks': 'Tasks',
+  'entry.inbox': 'Inbox',
+  'entry.agents': 'Agents',
+  'new.label': 'New task',
+  'new.tooltip': 'New task',
   'project.new.title': 'New Taskboard',
   'project.new.description':
     'A taskboard is a project: its own columns and its own issues. Bind it to a project folder now, or leave the folder empty and add one later.',
@@ -120,7 +124,9 @@ export function apply(ctx: ClientContext): void {
         order: 20,
         label: () => 'Taskboard',
       },
-      props => <BoardView {...props} openSession={id => openSessionWhenListed(ctx, id)} t={t} />,
+      props => (
+        <TaskHubWorkspace {...props} openSession={id => openSessionWhenListed(ctx, id)} t={t} />
+      ),
     ),
   )
 
@@ -132,13 +138,15 @@ export function apply(ctx: ClientContext): void {
         id: 'taskboard-entry',
         order: 10,
         locale: 'taskboard',
-        inject: () => ({
-          onOpen: () => {
-            openTaskboardFromSidebar(ctx)
-          },
-        }),
       },
-      TaskboardSidebarEntry,
+      props => (
+        <TaskboardSidebarEntry
+          {...props}
+          onOpen={view => {
+            openTaskboardFromSidebar(ctx, view)
+          }}
+        />
+      ),
     ),
   )
 
@@ -152,14 +160,15 @@ export function apply(ctx: ClientContext): void {
         id: 'taskboard-new',
         order: 10,
         locale: 'taskboard',
-        inject: () => ({
-          onOpen: () => {
-            openTaskboardFromSidebar(ctx)
-          },
-          onCreated: () => {},
-        }),
       },
-      NewTaskboardSidebarEntry,
+      props => (
+        <NewTaskboardSidebarEntry
+          {...props}
+          onOpen={() => {
+            openTaskboardFromSidebar(ctx, 'tasks')
+          }}
+        />
+      ),
     ),
   )
 }

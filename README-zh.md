@@ -39,6 +39,9 @@
 | 两道人工关口            | agent 永远不能把 issue 移出 `proposed`，也永远不能把自己标成 `done`：提案需要你批准，完成的工作需要你验收——都在服务层强制，不是 UI 上的约定                   |
 | 持久化审批队列          | agent 提出的 issue 落在 `proposed` 列，等真人批准或拒绝——跨重启持久保存，不像一次性审批弹窗那样会丢                                                           |
 | 看板是聊天的平级页签    | 看板注册进 conversation view ring，作为 Chat / Trajectory 旁边的一个页签出现，而不是独立页面                                                                  |
+| Task Hub 侧边栏         | 常驻的「任务 / 收件箱 / 智能体」入口打开同一个工作区级 Hub；任务卡片可跨状态列拖拽，并以完整文档和属性栏查看                                                  |
+| 用户自建智能体          | 用户为智能体设置名称、职责、长期指令与 Harness Agent Preset；任务分配和执行历史记录用户身份，不再把运行时 preset 当作智能体                                   |
+| 人工收件箱              | 智能体提案、待审核结果、失败执行和跨智能体消息进入同一个可读/归档队列，可直接打开任务、审核结果或跳转执行会话                                                 |
 
 ---
 
@@ -145,7 +148,7 @@ const res = await fetch('/_dsh/taskboard/rpc', {
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%
 graph LR
-    UI[Board View<br/>React] -->|RPC + SSE| SVC[Taskboard Service<br/>Cordis Plugin]
+    UI[Task Hub<br/>任务 · 收件箱 · 智能体] -->|RPC + SSE| SVC[Taskboard Service<br/>Cordis Plugin]
     TOOLS[taskboard_* Tools<br/>Model-facing] --> SVC
     PLAN[taskboard_plan<br/>Workflow Engine] -->|fresh subagents| TOOLS
     SVC --> DB[(Storage Domain)]
@@ -185,21 +188,23 @@ graph LR
 
 浏览器端与宿主端通过一个端点通信：`POST /_dsh/taskboard/rpc`，请求体为 `{ method, params }`，而不是每个资源一条 REST 路径。DeepSeek Harness 的类型化 RPC 层需要构建期代码生成，而本插件的构建不跑这一步，所以路由刻意保持显式——原因见 [docs/spike-findings.md](docs/spike-findings.md)。
 
-| 方法                  | 说明                                                             |
-| --------------------- | ---------------------------------------------------------------- |
-| `board.view`          | 当前会话所属的看板（按工作区解析），附带实时调度器状态           |
-| `project.list`        | 列出所有项目                                                     |
-| `project.create`      | 创建项目                                                         |
-| `task.list`           | 列出 issue，可按项目、状态或会话过滤                             |
-| `task.get`            | 读取单个 issue 及其评论与活动流水                                |
-| `task.create`         | 创建 issue                                                       |
-| `task.update`         | 修改 issue；过期的 `expectedVersion` 会被拒绝                    |
-| `comment.create`      | 给 issue 加评论                                                  |
-| `task.start`          | 为单个 issue 新建一个独立会话并把活交给它                        |
-| `task.startNext`      | 不指名地开工下一个 `todo` issue——优先级最高者优先                |
-| `task.accept`         | 验收完成的工作（`in_review` → `done`）——agent 无法越过的人工关口 |
-| `task.sendBack`       | 把完成的工作打回 `todo` 并附理由（落成一条评论），同时解绑其会话 |
-| `scheduler.configure` | 修改并行度或自动拉取开关；返回修改后的状态                       |
+| 方法                  | 说明                                                              |
+| --------------------- | ----------------------------------------------------------------- |
+| `board.view`          | 当前会话所属的看板（按工作区解析），附带实时调度器状态            |
+| `project.list`        | 列出所有项目                                                      |
+| `project.create`      | 创建项目                                                          |
+| `task.list`           | 列出 issue，可按项目、状态或会话过滤                              |
+| `task.get`            | 读取单个 issue 及其评论与活动流水                                 |
+| `task.create`         | 创建 issue                                                        |
+| `task.update`         | 修改 issue；过期的 `expectedVersion` 会被拒绝                     |
+| `comment.create`      | 给 issue 加评论                                                   |
+| `task.start`          | 为单个 issue 新建一个独立会话并把活交给它                         |
+| `task.startNext`      | 不指名地开工下一个 `todo` issue——优先级最高者优先                 |
+| `task.accept`         | 验收完成的工作（`in_review` → `done`）——agent 无法越过的人工关口  |
+| `task.sendBack`       | 把完成的工作打回 `todo` 并附理由（落成一条评论），同时解绑其会话  |
+| `scheduler.configure` | 修改并行度或自动拉取开关；返回修改后的状态                        |
+| `agent.*`             | 列出、创建、编辑、归档和恢复用户自建智能体，并列出 Harness 运行时 |
+| `inbox.*`             | 列出派生的人工收件箱事件，并持久化已读和归档状态                  |
 
 变更通知通过 `GET /_dsh/taskboard/events` 以 Server-Sent Events 推送。
 
@@ -211,6 +216,9 @@ graph LR
 src/
 ├── client/              # 浏览器端
 │   ├── board.tsx         # BoardView：列、卡片、调度器控制条、审批与验收控件
+│   ├── agents.tsx         # 用户自建智能体列表、编辑、详情、运行时与最近工作
+│   ├── inbox.tsx          # 事件列表与可执行操作的收件箱详情
+│   ├── workspace.tsx      # 任务 / 收件箱 / 智能体工作区路由
 │   ├── index.tsx          # 客户端插件入口、slot 注册
 │   ├── rpc.ts              # 基于 fetch() 的 RPC 客户端 + SSE 订阅
 │   └── styles.ts            # 仅布局的 CSS；所有颜色都是主题 token

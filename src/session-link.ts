@@ -28,15 +28,21 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-goal'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { LOCAL_USER } from './actors.ts'
-import type { Actor, Project, SessionMessage, Task } from './domain.ts'
+import type { Actor, AgentProfile, Project, SessionMessage, Task } from './domain.ts'
 import { byPriority } from './plan-loop.ts'
 import { nextRunAtMs } from './schedule.ts'
 import { TaskboardError, type Taskboard } from './service.ts'
 import type { SchedulerConfig, SchedulerState } from './wire.ts'
 
 /** What the model is told when an issue is handed to a fresh session. */
-function briefFor(task: Task): string {
+function briefFor(task: Task, profile: AgentProfile | undefined): string {
   return [
+    profile !== undefined
+      ? `You are ${profile.name}, a user-created agent assigned to this issue.`
+      : '',
+    profile?.instructions.trim() === '' || profile?.instructions === undefined
+      ? ''
+      : `Your standing instructions:\n${profile.instructions.trim()}`,
     `You are working board issue ${task.id}: **${task.title}**`,
     task.description.trim() === '' ? '' : `\n${task.description.trim()}`,
     '',
@@ -141,7 +147,7 @@ export async function startTask(
   ctx: Context,
   board: Taskboard,
   taskId: string,
-  opts: { force?: boolean; cwd?: string } = {},
+  opts: { force?: boolean; cwd?: string; agentProfileId?: string } = {},
 ): Promise<Task> {
   const agents = ctx.reflect.get('agents')
   if (agents === undefined)
@@ -156,6 +162,15 @@ export async function startTask(
   const live =
     current.sessionId !== undefined && agents.get(SessionId(current.sessionId)) !== undefined
   if (live && opts.force !== true) return current
+
+  const profileId = opts.agentProfileId ?? current.agentProfileId
+  const profile = profileId === undefined ? undefined : board.getAgentProfile(profileId)
+  if (profileId !== undefined && profile === undefined) {
+    throw new TaskboardError('not-found', `agent "${profileId}" does not exist`)
+  }
+  if (profile?.archivedAt !== undefined) {
+    throw new TaskboardError('forbidden', `agent "${profile.name}" is archived`)
+  }
 
   // The issue's own project decides where its session runs, so work lands in the
   // repository the board belongs to. A project without a workspace path (the
@@ -174,7 +189,7 @@ export async function startTask(
   const cwd = board.getProject(current.projectId)?.workspacePath ?? opts.cwd ?? process.cwd()
   const selection = ctx.reflect.get('agentDefaultModel', false)?.currentSelection?.()
   const presets = ctx.reflect.get('agentPresets', false)
-  const preset = await presets?.resolve().catch(() => undefined)
+  const preset = await presets?.resolve(profile?.presetId).catch(() => undefined)
   const handle = await agents.create({
     sessionId: SessionId(crypto.randomUUID()),
     meta: {
@@ -225,6 +240,7 @@ export async function startTask(
   const task = await board.openExecution(taskId, agent.id, {
     actor: LOCAL_USER,
     expectedVersion: current.version,
+    ...(profile !== undefined ? { agentProfile: profile } : {}),
     ...(moved !== undefined ? { status: moved } : {}),
   })
 
@@ -243,7 +259,7 @@ export async function startTask(
 
   agent.followup(
     createUserMessage({
-      content: [{ type: 'text', text: briefFor(task) }],
+      content: [{ type: 'text', text: briefFor(task, profile) }],
       source: { kind: 'user' },
     }),
   )

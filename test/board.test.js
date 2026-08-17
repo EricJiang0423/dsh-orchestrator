@@ -126,8 +126,8 @@ async function boardFixture(options = {}) {
         super(context, 'agentPresets')
       }
       mounts = []
-      async resolve() {
-        return { id: 'standard' }
+      async resolve(id) {
+        return { id: id ?? 'standard' }
       }
       async mount(ctx, id) {
         this.mounts.push({ ctx, id })
@@ -480,6 +480,122 @@ test('starting an issue opens a fresh session, moves it, and hands it over', asy
 
   const kinds = board.listActivity(task.id).map(row => row.kind)
   assert.deepEqual(kinds, ['created', 'status', 'session'])
+})
+
+test('user-created agents keep identity separate from their Harness preset', async () => {
+  const { board, ctx } = await boardFixture({ withAgents: true })
+  await board.createProject({ id: 'p1', name: 'Demo', workspacePath: '/repo' })
+  const profile = await board.createAgentProfile({
+    projectId: 'p1',
+    name: '主力开发',
+    description: '负责功能交付',
+    instructions: '先运行测试，再修改实现。',
+    presetId: 'coding-runtime',
+  })
+  const task = await board.createTask(
+    { projectId: 'p1', title: '实现拖拽', agentProfileId: profile.id },
+    human,
+  )
+
+  const started = await fromRestrictedFiber(ctx, child => startTask(child, board, task.id))
+  const execution = started.executions.at(-1)
+  await ctx.agents.entries[0].options.setup({ on: () => () => {} })
+
+  assert.equal(ctx.agents.entries[0].options.meta.agentPreset, 'coding-runtime')
+  assert.equal(ctx.agentPresets.mounts[0].id, 'coding-runtime')
+  assert.equal(started.agentProfileId, profile.id)
+  assert.equal(started.assignee.name, '主力开发')
+  assert.equal(execution.agentProfileId, profile.id)
+  assert.equal(execution.agentName, '主力开发')
+  const brief = ctx.agents.get(started.sessionId).followups[0].content[0].text
+  assert.match(brief, /主力开发/)
+  assert.match(brief, /先运行测试，再修改实现/)
+})
+
+test('agent profiles support versioned edits and reversible archive', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const created = await board.createAgentProfile({
+    projectId: 'p1',
+    name: 'Reviewer',
+    presetId: 'review-runtime',
+  })
+  const updated = await board.updateAgentProfile(
+    created.id,
+    { name: 'Lead reviewer', instructions: 'Check every acceptance condition.' },
+    created.version,
+  )
+  assert.equal(updated.version, 1)
+  assert.equal(updated.name, 'Lead reviewer')
+  await assert.rejects(
+    () => board.updateAgentProfile(created.id, { name: 'Stale' }, created.version),
+    err => err instanceof TaskboardError && err.code === 'version-conflict',
+  )
+
+  const archived = await board.setAgentProfileArchived(updated.id, true, updated.version)
+  assert.ok(archived.archivedAt)
+  assert.deepEqual(board.listAgentProfiles('p1'), [])
+  assert.equal(board.listAgentProfiles('p1', true).length, 1)
+  const restored = await board.setAgentProfileArchived(archived.id, false, archived.version)
+  assert.equal(restored.archivedAt, undefined)
+})
+
+test('the inbox derives actionable events and persists read and archive state', async () => {
+  const { board } = await boardFixture()
+  await board.createProject({ id: 'p1', name: 'Demo' })
+  const profile = await board.createAgentProfile({
+    projectId: 'p1',
+    name: 'Builder',
+    presetId: 'standard',
+  })
+  const proposal = await board.createTask(
+    {
+      projectId: 'p1',
+      title: 'Suggested work',
+      status: 'proposed',
+      origin: 'agent',
+      proposedBy: { agent: 'Builder' },
+    },
+    robot,
+  )
+  const failed = await board.createTask(
+    { projectId: 'p1', title: 'Broken run', status: 'todo', agentProfileId: profile.id },
+    human,
+  )
+  await board.openExecution(failed.id, 'session-failed', {
+    actor: human,
+    status: 'in_progress',
+    agentProfile: profile,
+  })
+  await board.settleExecution(failed.id, 'failed', {
+    actor: robot,
+    status: 'failed',
+    error: 'Tests failed',
+  })
+  await board.postMessage({
+    projectId: 'p1',
+    fromSessionId: 'session-source',
+    fromAgent: { type: 'agent', id: profile.id, name: profile.name },
+    toSessionId: 'session-failed',
+    toIssueId: failed.id,
+    body: '需要人工确认依赖版本。',
+  })
+
+  const inbox = board.listInbox('p1')
+  assert.deepEqual(
+    new Set(inbox.map(item => item.type)),
+    new Set(['proposal', 'execution_failed', 'agent_message']),
+  )
+  assert.equal(inbox.find(item => item.type === 'execution_failed').agentName, 'Builder')
+  const proposalItem = inbox.find(item => item.taskId === proposal.id)
+  const read = await board.updateInboxItem('p1', proposalItem.id, { read: true })
+  assert.ok(read.readAt)
+  const archived = await board.updateInboxItem('p1', proposalItem.id, { archived: true })
+  assert.ok(archived.readAt)
+  assert.ok(archived.archivedAt)
+  const restored = await board.updateInboxItem('p1', proposalItem.id, { archived: false })
+  assert.ok(restored.readAt)
+  assert.equal(restored.archivedAt, undefined)
 })
 
 test('an issue with a live session is not started twice', async () => {

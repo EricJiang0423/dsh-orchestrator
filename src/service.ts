@@ -18,12 +18,16 @@ import {
   SCHEDULER_SETTINGS_KEY,
   type Activity,
   type ActivityId,
+  type AgentProfile,
+  type AgentProfileId,
   type Actor,
   type Comment,
   type CommentId,
   type ExecutionRecord,
   type ExecutionResult,
   type MessageId,
+  type InboxReceipt,
+  type InboxReceiptId,
   type Project,
   type ProjectId,
   type SchedulerSettings,
@@ -69,6 +73,24 @@ export interface TaskFilter {
   sessionId?: string
 }
 
+/** Event types shown in the human inbox. */
+export type InboxItemType = 'proposal' | 'review_ready' | 'execution_failed' | 'agent_message'
+
+/** One actionable or informational event joined to its task and agent identity. */
+export interface InboxItem {
+  id: string
+  projectId: string
+  type: InboxItemType
+  taskId: string
+  title: string
+  summary: string
+  createdAt: string
+  agentName?: string
+  sessionId?: string
+  readAt?: string
+  archivedAt?: string
+}
+
 /** Fields a caller may set when creating an issue. */
 export interface CreateTaskInput {
   projectId: string
@@ -78,6 +100,7 @@ export interface CreateTaskInput {
   priority?: Task['priority']
   labels?: string[]
   assignee?: Actor
+  agentProfileId?: string
   dueDate?: string
   startDate?: string
   origin?: Task['origin']
@@ -92,7 +115,7 @@ export interface CreateTaskInput {
  * session all stay with the issue). A moved issue keeps its version chain, so
  * concurrent writers are still fenced the usual way.
  */
-export type UpdateTaskPatch = Partial<
+type UpdateTaskFields = Partial<
   Pick<
     Task,
     | 'title'
@@ -101,6 +124,7 @@ export type UpdateTaskPatch = Partial<
     | 'priority'
     | 'labels'
     | 'assignee'
+    | 'agentProfileId'
     | 'dueDate'
     | 'startDate'
     | 'relations'
@@ -109,6 +133,11 @@ export type UpdateTaskPatch = Partial<
     | 'projectId'
   >
 >
+
+/** Task patch with JSON-null support for clearing the selected agent. */
+export type UpdateTaskPatch = Omit<UpdateTaskFields, 'agentProfileId'> & {
+  agentProfileId?: string | null
+}
 
 /** Gap between adjacent sort keys handed out for appends. */
 const SORT_STEP = 1024
@@ -124,6 +153,7 @@ const CLEARABLE_TASK_FIELDS = new Set([
   'priority',
   'labels',
   'assignee',
+  'agentProfileId',
   'dueDate',
   'startDate',
   'relations',
@@ -147,13 +177,15 @@ export class Taskboard extends Service {
   private activities!: KvTable<ActivityId, Activity>
   private messages!: KvTable<MessageId, SessionMessage>
   private settings!: KvTable<SettingsKey, SchedulerSettings>
+  private agents!: KvTable<AgentProfileId, AgentProfile>
+  private inboxReceipts!: KvTable<InboxReceiptId, InboxReceipt>
 
   /** @param ctx - Plugin context carrying the domain facility. */
   constructor(ctx: Context) {
     super(ctx, 'taskboard')
   }
 
-  /** Open the board domain and bind its six table handles. */
+  /** Open the board domain and bind its eight table handles. */
   async [Service.init](): Promise<void> {
     const domain: Domain<typeof taskboardDomain> =
       await this.ctx.storageDomain.open(taskboardDomain)
@@ -164,6 +196,113 @@ export class Taskboard extends Service {
     this.activities = domain.table('activities')
     this.messages = domain.table('messages')
     this.settings = domain.table('settings')
+    this.agents = domain.table('agents')
+    this.inboxReceipts = domain.table('inbox_receipts')
+  }
+
+  // ── user-created agents ───────────────────────────────────────────────────
+
+  /** List one project's agent profiles, active by default. */
+  listAgentProfiles(projectId: string, includeArchived = false): AgentProfile[] {
+    return [...this.agents.entries()]
+      .map(([, agent]) => agent)
+      .filter(
+        agent =>
+          agent.projectId === projectId && (includeArchived || agent.archivedAt === undefined),
+      )
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  }
+
+  /** Read one user-created agent profile. */
+  getAgentProfile(id: string): AgentProfile | undefined {
+    return this.agents.get(id as AgentProfileId)
+  }
+
+  /** Create a durable agent identity for one board. */
+  async createAgentProfile(input: {
+    projectId: string
+    name: string
+    description?: string
+    instructions?: string
+    presetId: string
+  }): Promise<AgentProfile> {
+    if (this.projects.get(input.projectId as ProjectId) === undefined) {
+      throw new TaskboardError('not-found', `project "${input.projectId}" does not exist`)
+    }
+    if (input.name.trim() === '') throw new TaskboardError('invalid-input', 'agent name is empty')
+    if (input.presetId.trim() === '')
+      throw new TaskboardError('invalid-input', 'agent preset is empty')
+    const now = new Date().toISOString()
+    const agent: AgentProfile = {
+      id: crypto.randomUUID(),
+      projectId: input.projectId,
+      name: input.name.trim(),
+      description: input.description?.trim() ?? '',
+      instructions: input.instructions?.trim() ?? '',
+      presetId: input.presetId,
+      version: 0,
+      createdAt: now,
+      updatedAt: now,
+    }
+    await this.agents.put(agent.id as AgentProfileId, agent)
+    return agent
+  }
+
+  /** Edit identity, behavior, or runtime while refusing stale forms. */
+  async updateAgentProfile(
+    id: string,
+    patch: Partial<Pick<AgentProfile, 'name' | 'description' | 'instructions' | 'presetId'>>,
+    expectedVersion?: number,
+  ): Promise<AgentProfile> {
+    if (this.agents.get(id as AgentProfileId) === undefined) {
+      throw new TaskboardError('not-found', `agent "${id}" does not exist`)
+    }
+    return this.agents.update(id as AgentProfileId, current => {
+      if (expectedVersion !== undefined && current.version !== expectedVersion) {
+        throw new TaskboardError(
+          'version-conflict',
+          `agent "${id}" is at version ${current.version}, not ${expectedVersion}`,
+        )
+      }
+      const name = patch.name?.trim()
+      const presetId = patch.presetId?.trim()
+      if (name === '') throw new TaskboardError('invalid-input', 'agent name is empty')
+      if (presetId === '') throw new TaskboardError('invalid-input', 'agent preset is empty')
+      return {
+        ...current,
+        ...(name !== undefined ? { name } : {}),
+        ...(patch.description !== undefined ? { description: patch.description.trim() } : {}),
+        ...(patch.instructions !== undefined ? { instructions: patch.instructions.trim() } : {}),
+        ...(presetId !== undefined ? { presetId } : {}),
+        version: current.version + 1,
+        updatedAt: new Date().toISOString(),
+      }
+    })
+  }
+
+  /** Archive or restore an agent without erasing execution history. */
+  async setAgentProfileArchived(
+    id: string,
+    archived: boolean,
+    expectedVersion?: number,
+  ): Promise<AgentProfile> {
+    if (this.agents.get(id as AgentProfileId) === undefined) {
+      throw new TaskboardError('not-found', `agent "${id}" does not exist`)
+    }
+    return this.agents.update(id as AgentProfileId, current => {
+      if (expectedVersion !== undefined && current.version !== expectedVersion) {
+        throw new TaskboardError(
+          'version-conflict',
+          `agent "${id}" is at version ${current.version}, not ${expectedVersion}`,
+        )
+      }
+      return {
+        ...current,
+        ...(archived ? { archivedAt: new Date().toISOString() } : { archivedAt: undefined }),
+        version: current.version + 1,
+        updatedAt: new Date().toISOString(),
+      }
+    })
   }
 
   // ── projects ──────────────────────────────────────────────────────────────
@@ -309,7 +448,12 @@ export class Taskboard extends Service {
   async openExecution(
     id: string,
     sessionId: string,
-    opts: { actor: Actor; expectedVersion?: number; status?: TaskStatus },
+    opts: {
+      actor: Actor
+      expectedVersion?: number
+      status?: TaskStatus
+      agentProfile?: AgentProfile
+    },
   ): Promise<Task> {
     return this.tasks.update(id as TaskId, current => {
       if (opts.expectedVersion !== undefined && current.version !== opts.expectedVersion) {
@@ -332,11 +476,20 @@ export class Taskboard extends Service {
         id: crypto.randomUUID(),
         sessionId,
         startedAt: Date.now(),
+        ...(opts.agentProfile !== undefined
+          ? { agentProfileId: opts.agentProfile.id, agentName: opts.agentProfile.name }
+          : {}),
       }
       const next: Task = {
         ...current,
         executions: [...current.executions, execution],
         sessionId,
+        ...(opts.agentProfile !== undefined
+          ? {
+              agentProfileId: opts.agentProfile.id,
+              assignee: { type: 'agent', id: opts.agentProfile.id, name: opts.agentProfile.name },
+            }
+          : {}),
         ...(opts.status !== undefined && opts.status !== current.status
           ? { status: opts.status }
           : {}),
@@ -382,6 +535,8 @@ export class Taskboard extends Service {
         id: open.id,
         startedAt: open.startedAt,
         ...(open.sessionId !== undefined ? { sessionId: open.sessionId } : {}),
+        ...(open.agentProfileId !== undefined ? { agentProfileId: open.agentProfileId } : {}),
+        ...(open.agentName !== undefined ? { agentName: open.agentName } : {}),
         endedAt: Date.now(),
         result,
         ...(opts.error !== undefined ? { error: opts.error } : {}),
@@ -509,6 +664,7 @@ export class Taskboard extends Service {
       priority: input.priority ?? 'none',
       labels: input.labels ?? [],
       ...(input.assignee !== undefined ? { assignee: input.assignee } : {}),
+      ...(input.agentProfileId !== undefined ? { agentProfileId: input.agentProfileId } : {}),
       creator,
       sortKey: this.nextSortKey(),
       ...(input.dueDate !== undefined ? { dueDate: input.dueDate } : {}),
@@ -561,7 +717,7 @@ export class Taskboard extends Service {
     // serialization drops it — so normalize null to undefined here, the one
     // choke point every caller passes through. Clearing a REQUIRED field is a
     // caller bug and is refused the same way (dropped from the patch).
-    const cleaned = {} as UpdateTaskPatch
+    const cleaned = {} as Omit<UpdateTaskPatch, 'agentProfileId'> & { agentProfileId?: string }
     for (const [key, value] of Object.entries(patch)) {
       if (value === null || value === undefined) {
         if (CLEARABLE_TASK_FIELDS.has(key)) (cleaned as Record<string, unknown>)[key] = undefined
@@ -781,6 +937,121 @@ export class Taskboard extends Service {
       ...message,
       deliveredAt: new Date().toISOString(),
     }))
+  }
+
+  // ── human inbox ──────────────────────────────────────────────────────────
+
+  /** Derive one board's inbox from durable task attempts, proposals, reviews, and agent mail. */
+  listInbox(projectId: string): InboxItem[] {
+    const items: InboxItem[] = []
+    for (const task of this.listTasks({ projectId })) {
+      const latest = task.executions[task.executions.length - 1]
+      if (task.status === 'proposed') {
+        items.push({
+          id: `proposal:${task.id}`,
+          projectId,
+          type: 'proposal',
+          taskId: task.id,
+          title: task.title,
+          summary: '智能体提出了一个待确认任务。',
+          createdAt: task.createdAt,
+          ...(task.proposedBy !== undefined ? { agentName: task.proposedBy.agent } : {}),
+        })
+      }
+      if (task.status === 'in_review') {
+        items.push({
+          id: `review:${task.id}:${latest?.id ?? 'current'}`,
+          projectId,
+          type: 'review_ready',
+          taskId: task.id,
+          title: task.title,
+          summary: '任务已完成，等待你的审核。',
+          createdAt:
+            latest?.endedAt !== undefined ? new Date(latest.endedAt).toISOString() : task.updatedAt,
+          ...(latest?.agentName !== undefined
+            ? { agentName: latest.agentName }
+            : task.assignee !== undefined
+              ? { agentName: task.assignee.name }
+              : {}),
+          ...(latest?.sessionId !== undefined ? { sessionId: latest.sessionId } : {}),
+        })
+      }
+      if (latest?.result === 'failed') {
+        items.push({
+          id: `execution:${latest.id}`,
+          projectId,
+          type: 'execution_failed',
+          taskId: task.id,
+          title: task.title,
+          summary: latest.error ?? '智能体执行失败。',
+          createdAt: new Date(latest.endedAt ?? latest.startedAt).toISOString(),
+          ...(latest.agentName !== undefined
+            ? { agentName: latest.agentName }
+            : task.assignee !== undefined
+              ? { agentName: task.assignee.name }
+              : {}),
+          ...(latest.sessionId !== undefined ? { sessionId: latest.sessionId } : {}),
+        })
+      }
+    }
+    for (const message of this.listMessages({ projectId })) {
+      const task = this.getTask(message.toIssueId)
+      items.push({
+        id: `message:${message.id}`,
+        projectId,
+        type: 'agent_message',
+        taskId: message.toIssueId,
+        title: task?.title ?? '已删除的任务',
+        summary: message.body,
+        createdAt: message.createdAt,
+        agentName: message.fromAgent.name,
+        sessionId: message.toSessionId,
+      })
+    }
+    return items
+      .map(item => {
+        const receipt = this.inboxReceipts.get(item.id as InboxReceiptId)
+        return receipt === undefined
+          ? item
+          : {
+              ...item,
+              ...(receipt.readAt !== undefined ? { readAt: receipt.readAt } : {}),
+              ...(receipt.archivedAt !== undefined ? { archivedAt: receipt.archivedAt } : {}),
+            }
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  }
+
+  /** Mark one derived inbox item read/unread or archived/restored. */
+  async updateInboxItem(
+    projectId: string,
+    id: string,
+    patch: { read?: boolean; archived?: boolean },
+  ): Promise<InboxItem> {
+    const item = this.listInbox(projectId).find(candidate => candidate.id === id)
+    if (item === undefined)
+      throw new TaskboardError('not-found', `inbox item "${id}" does not exist`)
+    const current = this.inboxReceipts.get(id as InboxReceiptId)
+    const now = new Date().toISOString()
+    const receipt: InboxReceipt = {
+      id,
+      ...(patch.read === true
+        ? { readAt: now }
+        : patch.read === false
+          ? {}
+          : current?.readAt !== undefined
+            ? { readAt: current.readAt }
+            : {}),
+      ...(patch.archived === true
+        ? { archivedAt: now }
+        : patch.archived === false
+          ? {}
+          : current?.archivedAt !== undefined
+            ? { archivedAt: current.archivedAt }
+            : {}),
+    }
+    await this.inboxReceipts.put(id as InboxReceiptId, receipt)
+    return this.listInbox(projectId).find(candidate => candidate.id === id)!
   }
 
   /**

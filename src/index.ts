@@ -28,7 +28,14 @@ export * from './wire.ts'
 export { isValidCron, nextRunAtMs, parseCron } from './schedule.ts'
 export { LOCAL_USER, agentActor } from './actors.ts'
 export { Taskboard, TaskboardError } from './service.ts'
-export type { CreateTaskInput, TaskFilter, TaskboardErrorCode, UpdateTaskPatch } from './service.ts'
+export type {
+  CreateTaskInput,
+  InboxItem,
+  InboxItemType,
+  TaskFilter,
+  TaskboardErrorCode,
+  UpdateTaskPatch,
+} from './service.ts'
 
 /** Cordis plugin name. Must match the package name so the client scan pairs up. */
 export const name = 'dsh-orchestrator'

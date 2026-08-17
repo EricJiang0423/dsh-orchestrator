@@ -13,10 +13,17 @@
  * parsing.
  * @module dsh-orchestrator/wire
  */
-import type { Activity, Comment, Project, SessionMessage, Task } from './domain.ts'
-import type { CreateTaskInput, TaskFilter, TaskboardErrorCode, UpdateTaskPatch } from './service.ts'
+import type { Activity, AgentProfile, Comment, Project, SessionMessage, Task } from './domain.ts'
+import type {
+  CreateTaskInput,
+  InboxItem,
+  TaskFilter,
+  TaskboardErrorCode,
+  UpdateTaskPatch,
+} from './service.ts'
 
 export type { ExecutionRecord, ExecutionResult, ScheduleRule } from './domain.ts'
+export type { InboxItem, InboxItemType } from './service.ts'
 
 /** How many issues may run at once, and whether the board fills those slots itself. */
 export interface SchedulerConfig {
@@ -77,6 +84,13 @@ export interface BoardView {
   messages: SessionMessage[]
 }
 
+/** Harness preset offered by the agent editor. */
+export interface AgentRuntimeOption {
+  id: string
+  name: string
+  broken?: string
+}
+
 /** Params and result of every callable method, keyed by method name. */
 export interface TaskboardApi {
   'project.list': { params: Record<never, never>; result: Project[] }
@@ -93,9 +107,15 @@ export interface TaskboardApi {
   }
   'comment.create': { params: { taskId: string; body: string }; result: Comment }
   /** Open a fresh session for one issue and hand it the work. */
-  'task.start': { params: { id: string; sessionId?: string }; result: Task }
+  'task.start': {
+    params: { id: string; sessionId?: string; agentProfileId?: string }
+    result: Task
+  }
   /** Re-run a settled/finished issue in a FRESH session (the live-session guard does not block it). */
-  'task.rerun': { params: { id: string; sessionId?: string }; result: Task }
+  'task.rerun': {
+    params: { id: string; sessionId?: string; agentProfileId?: string }
+    result: Task
+  }
   /** Arm/disarm or change an issue's cron schedule. */
   'task.schedule': {
     params: { id: string; patch: SchedulePatch; expectedVersion?: number }
@@ -129,6 +149,38 @@ export interface TaskboardApi {
     params: { sessionId: string; toIssueId?: string; toSessionId?: string; body: string }
     result: SessionMessage
   }
+  'agent.list': {
+    params: { projectId: string; includeArchived?: boolean }
+    result: AgentProfile[]
+  }
+  'agent.runtime.list': { params: Record<never, never>; result: AgentRuntimeOption[] }
+  'agent.create': {
+    params: {
+      projectId: string
+      name: string
+      description?: string
+      instructions?: string
+      presetId: string
+    }
+    result: AgentProfile
+  }
+  'agent.update': {
+    params: {
+      id: string
+      patch: Partial<Pick<AgentProfile, 'name' | 'description' | 'instructions' | 'presetId'>>
+      expectedVersion?: number
+    }
+    result: AgentProfile
+  }
+  'agent.archive': {
+    params: { id: string; archived: boolean; expectedVersion?: number }
+    result: AgentProfile
+  }
+  'inbox.list': { params: { projectId: string }; result: InboxItem[] }
+  'inbox.update': {
+    params: { projectId: string; id: string; patch: { read?: boolean; archived?: boolean } }
+    result: InboxItem
+  }
 }
 
 /** Callable method names. */
@@ -158,6 +210,13 @@ export const TASKBOARD_METHODS = [
   'scheduler.configure',
   'message.list',
   'message.post',
+  'agent.list',
+  'agent.runtime.list',
+  'agent.create',
+  'agent.update',
+  'agent.archive',
+  'inbox.list',
+  'inbox.update',
 ] as const satisfies readonly TaskboardMethod[]
 
 /** What the host answers. Failures carry the service's own code. */
